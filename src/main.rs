@@ -70,7 +70,7 @@ async fn upload_sweeper(app: AppRef) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         let cutoff = db::now() - 86_400;
-        let stale = db::run(&app.pool, move |conn| {
+        let stale = db::run_write(&app.pool, move |conn| {
             let stale: Vec<String> = u::table
                 .filter(u::created_at.lt(cutoff))
                 .select(u::uuid)

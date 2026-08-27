@@ -206,7 +206,7 @@ pub async fn sync_repo(app: &AppRef, repo: &str, doc: IndexDoc, etag: String) ->
     }
 
     let repo2 = repo.to_string();
-    db::run(&app.pool, move |conn| {
+    db::run_write(&app.pool, move |conn| {
         use crate::schema::{manifest_refs as r, manifests as m, repos as rp, tags as t};
         conn.immediate_transaction::<_, anyhow::Error, _>(|conn| {
             let rid = db::get_or_create_repo(conn, &repo2)?;
@@ -388,7 +388,7 @@ pub async fn ensure_blob_local(app: &AppRef, digest: &str) -> anyhow::Result<Opt
     }
     let size = app.store.commit(&staging_id, digest).await? as i64;
     let digest2 = digest.to_string();
-    db::run(&app.pool, move |conn| {
+    db::run_write(&app.pool, move |conn| {
         diesel::insert_into(b::table)
             .values((b::digest.eq(&digest2), b::size.eq(size), b::created_at.eq(db::now())))
             .on_conflict(b::digest)

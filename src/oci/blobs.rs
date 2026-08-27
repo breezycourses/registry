@@ -99,7 +99,7 @@ pub async fn delete(app: &AppRef, id: &Identity, _name: &str, digest: &str) -> R
     }
     use crate::schema::{blobs as b, manifest_refs as r};
     let digest2 = digest.to_string();
-    let result = db::run(&app.pool, move |conn| {
+    let result = db::run_write(&app.pool, move |conn| {
         let referenced: i64 = r::table
             .filter(r::child_digest.eq(&digest2).and(r::kind.eq("blob")))
             .count()

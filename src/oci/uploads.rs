@@ -105,7 +105,7 @@ pub async fn start(
     {
         use crate::schema::uploads as u;
         let (uuid2, name2) = (uuid.clone(), name.to_string());
-        let created = db::run(&app.pool, move |conn| {
+        let created = db::run_write(&app.pool, move |conn| {
             let rid = db::get_or_create_repo(conn, &name2)?;
             diesel::insert_into(u::table)
                 .values((
@@ -183,7 +183,7 @@ pub async fn patch(
     {
         use crate::schema::uploads as u;
         let uuid2 = uuid.to_string();
-        let updated = db::run(&app.pool, move |conn| {
+        let updated = db::run_write(&app.pool, move |conn| {
             diesel::update(u::table.filter(u::uuid.eq(&uuid2)))
                 .set(u::bytes_received.eq(total))
                 .execute(conn)?;
@@ -253,7 +253,7 @@ pub async fn cancel(app: &AppRef, id: &Identity, _name: &str, uuid: &str) -> Res
 async fn cleanup(app: &AppRef, uuid: &str) {
     use crate::schema::uploads as u;
     let uuid2 = uuid.to_string();
-    let _ = db::run(&app.pool, move |conn| {
+    let _ = db::run_write(&app.pool, move |conn| {
         diesel::delete(u::table.filter(u::uuid.eq(&uuid2))).execute(conn)?;
         Ok(())
     })
@@ -297,7 +297,7 @@ async fn finalize(app: &AppRef, name: &str, uuid: &str, digest: &str) -> Respons
         use crate::schema::blobs as b;
         use crate::schema::uploads as u;
         let (digest2, uuid2) = (digest.to_string(), uuid.to_string());
-        let done = db::run(&app.pool, move |conn| {
+        let done = db::run_write(&app.pool, move |conn| {
             diesel::insert_into(b::table)
                 .values((
                     b::digest.eq(&digest2),

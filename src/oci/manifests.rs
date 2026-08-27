@@ -222,7 +222,7 @@ pub async fn put(
     let payload = bytes.to_vec();
     let size = payload.len() as i64;
 
-    let result = db::run(&app.pool, move |conn| {
+    let result = db::run_write(&app.pool, move |conn| {
         conn.immediate_transaction::<_, anyhow::Error, _>(|conn| {
             let rid = db::get_or_create_repo(conn, &name2)?;
 
@@ -431,7 +431,7 @@ pub async fn delete(app: &AppRef, id: &Identity, name: &str, reference: &str) ->
     }
     use crate::schema::{manifests as m, tags as t};
     let (name2, ref2) = (name.to_string(), reference.to_string());
-    let result = db::run(&app.pool, move |conn| {
+    let result = db::run_write(&app.pool, move |conn| {
         conn.immediate_transaction::<_, anyhow::Error, _>(|conn| {
             let Some(rid) = db::repo_id(conn, &name2)? else {
                 return Ok(false);

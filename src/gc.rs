@@ -162,7 +162,7 @@ pub async fn run(app: &AppRef, dry_run: bool) -> anyhow::Result<GcReport> {
         }
     } else {
         let ids: Vec<i64> = victims.iter().map(|(id, _, _)| *id).collect();
-        db::run(&app.pool, move |conn| {
+        db::run_write(&app.pool, move |conn| {
             use crate::schema::manifests as m;
             for chunk in ids.chunks(500) {
                 diesel::delete(m::table.filter(m::id.eq_any(chunk))).execute(conn)?;
@@ -175,7 +175,7 @@ pub async fn run(app: &AppRef, dry_run: bool) -> anyhow::Result<GcReport> {
     // Blob rows: guarded delete — NOT EXISTS re-checks references at delete
     // time, so a blob re-referenced mid-sweep is rescued.
     let digests: Vec<String> = blob_victims.iter().map(|(d, _)| d.clone()).collect();
-    let actually_deleted: Vec<String> = db::run(&app.pool, move |conn| {
+    let actually_deleted: Vec<String> = db::run_write(&app.pool, move |conn| {
         use crate::schema::{blobs as b, manifest_refs as r};
         let mut deleted = vec![];
         for d in &digests {

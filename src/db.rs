@@ -109,6 +109,29 @@ where
     .await?
 }
 
+/// SQLite has exactly one writer; pretending otherwise means concurrent
+/// `BEGIN IMMEDIATE`s racing the busy timeout under load (a parallel crane
+/// push, say), and a timed-out BEGIN leaves diesel's transaction manager
+/// poisoned — every later transaction on that pooled connection fails with
+/// "cannot rollback - no transaction is active". So writes take one global
+/// lock and never contend at the SQLite layer at all; reads (`run`) stay
+/// concurrent under WAL.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub async fn run_write<T, F>(pool: &DbPool, f: F) -> anyhow::Result<T>
+where
+    F: FnOnce(&mut SqliteConnection) -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let pool = pool.clone();
+    tokio::task::spawn_blocking(move || {
+        let _serialized = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut conn = pool.get()?;
+        f(&mut conn)
+    })
+    .await?
+}
+
 pub fn get_or_create_repo(conn: &mut SqliteConnection, repo_name: &str) -> anyhow::Result<i64> {
     use crate::schema::repos as r;
     diesel::insert_into(r::table)
