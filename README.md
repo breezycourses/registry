@@ -4,12 +4,23 @@
 
 # Breezy Registry
 
+[![CI](https://github.com/breezycourses/registry/actions/workflows/ci.yml/badge.svg)](https://github.com/breezycourses/registry/actions/workflows/ci.yml)
+[![Image](https://github.com/breezycourses/registry/actions/workflows/release.yml/badge.svg)](https://github.com/breezycourses/registry/pkgs/container/registry)
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/breezy-registry)](https://artifacthub.io/packages/search?repo=breezy-registry)
+
 A single-binary OCI container registry in Rust. The reliability profile of a
 minimal registry, with the parts of Harbor worth keeping — a web UI, access
 control, retention-friendly GC — and none of its ~10-service architecture.
 
 ```bash
+# from source
 cargo run                      # open mode on :5100, data in ./data
+# or the published image
+docker run -p 5100:5100 -v breezy-data:/data ghcr.io/breezycourses/registry:latest
+# or the Helm chart
+helm repo add breezy-registry https://breezycourses.github.io/registry
+helm install registry breezy-registry/breezy-registry
+
 docker push localhost:5100/team/app:v1
 open http://localhost:5100     # web UI
 ```

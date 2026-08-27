@@ -1,8 +1,11 @@
 image:
-  repository: ghcr.io/breezy/breezy-registry
+  repository: ghcr.io/breezycourses/registry
   # Defaults to the chart's appVersion.
   tag: ""
   pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+#  - name: registry-creds
 
 # Only takes effect when sharding.enabled=true; a plain install is always 1 replica
 # (SQLite has a single writer — scale out with sharding, not replicas).

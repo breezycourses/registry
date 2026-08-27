@@ -4,3 +4,5 @@ charts
 tests
 *.md
 .git
+ui/node_modules
+assets

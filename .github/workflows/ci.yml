@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+      - name: Build UI
+        working-directory: ui
+        run: |
+          bun install --frozen-lockfile || bun install
+          bun run build
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Unit tests
+        run: cargo test
+
+      - name: Build
+        run: cargo build
+
+      - name: End-to-end (local mode)
+        run: |
+          BREEZY_CONFIG=/nonexistent ./target/debug/breezy-registry &
+          for i in $(seq 30); do curl -sf http://localhost:5100/healthz && break; sleep 0.5; done
+          ./tests/e2e.sh
+
+      - name: End-to-end (object mode, fs bucket)
+        run: |
+          cat > /tmp/objfs.toml <<'EOF'
+          listen = "0.0.0.0:5110"
+          data_dir = "/tmp/objfs-data"
+          gc_grace_seconds = 0
+          [object_storage]
+          path = "/tmp/bucket"
+          EOF
+          BREEZY_CONFIG=/tmp/objfs.toml ./target/debug/breezy-registry &
+          for i in $(seq 30); do curl -sf http://localhost:5110/healthz && break; sleep 0.5; done
+          REG=localhost:5110 ./tests/e2e.sh
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint chart
+        run: |
+          helm lint charts/breezy-registry
+          helm template test charts/breezy-registry > /dev/null
+          helm template test charts/breezy-registry \
+            --set sharding.enabled=true --set replicaCount=3 \
+            --set objectStorage.enabled=true --set ui.enabled=false > /dev/null
