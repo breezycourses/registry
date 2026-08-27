@@ -101,12 +101,33 @@ pub fn valid_tag(t: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
 }
 
+/// Percent-decode a query component. Some clients send `digest=sha256:...`
+/// with a literal colon (docker), others encode it as `%3A` (crane and
+/// anything else built on Go's url package) — both must parse identically.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub fn query_map(query: Option<&str>) -> HashMap<String, String> {
     let mut map = HashMap::new();
     if let Some(q) = query {
         for pair in q.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
-                map.insert(k.to_string(), v.to_string());
+                map.insert(percent_decode(k), percent_decode(v));
             }
         }
     }
@@ -245,6 +266,13 @@ pub async fn handle(State(app): State<AppRef>, req: Request) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_decodes_percent_encoding() {
+        let m = query_map(Some("digest=sha256%3Aabc&mount=sha256:def"));
+        assert_eq!(m["digest"], "sha256:abc");
+        assert_eq!(m["mount"], "sha256:def");
+    }
 
     #[test]
     fn routes_parse() {

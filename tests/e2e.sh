@@ -54,6 +54,12 @@ check "PUT finalize" 201 "$(code -X PUT "http://$REG$LOC?digest=$LAYER_DIGEST")"
 curl -s $AUTH "http://$REG/v2/team/app/blobs/$LAYER_DIGEST" > "$TMP/layer.out"
 check "blob round-trips" "$LAYER_DIGEST" "$(digest_of "$TMP/layer.out")"
 
+### percent-encoded digest accepted (crane/go clients encode the colon)
+echo -n '{"enc":"test"}' > "$TMP/enc.json"
+ENC_DIGEST=$(digest_of "$TMP/enc.json")
+check "monolithic POST, %3A digest" 201 "$(code -X POST --data-binary @"$TMP/enc.json" \
+  "http://$REG/v2/team/app/blobs/uploads/?digest=${ENC_DIGEST/sha256:/sha256%3A}")"
+
 ### digest mismatch rejected
 check "bad digest rejected" 400 "$(code -X POST --data-binary @"$TMP/config.json" \
   "http://$REG/v2/team/app/blobs/uploads/?digest=sha256:$(printf 'a%.0s' {1..64})")"
