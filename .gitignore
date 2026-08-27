@@ -3,3 +3,5 @@
 breezy.toml
 nohup.out
 ui/node_modules
+.idea
+ui/dist
