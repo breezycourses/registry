@@ -59,9 +59,15 @@ struct Pragmas;
 
 impl CustomizeConnection<SqliteConnection, diesel::r2d2::Error> for Pragmas {
     fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), diesel::r2d2::Error> {
+        // temp_store=MEMORY: SQLite spills large transactions into temp files
+        // it looks for under /var/tmp:/usr/tmp:/tmp — none of which exist in a
+        // scratch container, so a big enough sync died with an auto-rollback
+        // (surfacing as "cannot rollback - no transaction is active"). Keeping
+        // temp structures in memory removes the dependency entirely.
         conn.batch_execute(
             "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000; \
-             PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;",
+             PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL; \
+             PRAGMA temp_store=MEMORY;",
         )
         .map_err(diesel::r2d2::Error::QueryError)
     }

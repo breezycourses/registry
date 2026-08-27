@@ -139,6 +139,10 @@ check "referrers lists signature" yes "$(echo "$REFS" | grep -q "$SIG_DIGEST" &&
 FILTERED=$(curl -s $AUTH "http://$REG/v2/team/app/referrers/$MANIFEST_DIGEST?artifactType=application/x-nonexistent")
 check "referrers filter excludes" 0 "$(echo "$FILTERED" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["manifests"]))')"
 
+### catalog
+CAT=$(curl -s $AUTH "http://$REG/v2/_catalog")
+check "catalog lists repo" yes "$(echo "$CAT" | grep -q "team/app" && echo yes || echo no)"
+
 ### management API
 check "api repos" 200 "$(code "http://$REG/api/v1/repos")"
 check "api tags" 200 "$(code "http://$REG/api/v1/tags?repo=team/app")"

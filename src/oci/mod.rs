@@ -19,6 +19,7 @@ use std::collections::HashMap;
 #[derive(Debug, PartialEq)]
 enum Route {
     Base,
+    Catalog,
     UploadStart(String),
     Upload(String, String),
     Blob(String, String),
@@ -30,6 +31,9 @@ enum Route {
 fn parse_route(rest: &str) -> Option<Route> {
     if rest.is_empty() {
         return Some(Route::Base);
+    }
+    if rest == "_catalog" {
+        return Some(Route::Catalog);
     }
     let mut best: Option<(usize, u8)> = None; // (index, marker id); longer marker wins ties
     let markers: [(&str, u8); 5] = [
@@ -152,7 +156,7 @@ pub async fn handle(State(app): State<AppRef>, req: Request) -> Response {
     // Sharding: redirect anything for a repo this instance doesn't own.
     if let Some(sh) = &app.cfg.sharding {
         let repo = match &route {
-            Route::Base => None,
+            Route::Base | Route::Catalog => None,
             Route::UploadStart(n)
             | Route::Upload(n, _)
             | Route::Blob(n, _)
@@ -212,6 +216,30 @@ pub async fn handle(State(app): State<AppRef>, req: Request) -> Response {
                 .header("docker-distribution-api-version", "registry/2.0")
                 .body(Body::from("{}"))
                 .unwrap()
+        }
+        (Route::Catalog, Method::GET) => {
+            if let Err(resp) = authorize(&app, &identity, Action::Pull) {
+                return resp;
+            }
+            use diesel::prelude::*;
+            let result = crate::db::run(&app.pool, |conn| {
+                use crate::schema::repos as rp;
+                Ok(rp::table
+                    .select(rp::name)
+                    .order(rp::name.asc())
+                    .load::<String>(conn)?)
+            })
+            .await;
+            match result {
+                Ok(repos) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "repositories": repos }).to_string(),
+                    ))
+                    .unwrap(),
+                Err(e) => errors::internal(e),
+            }
         }
         (Route::UploadStart(name), Method::POST) => {
             uploads::start(&app, &identity, &name, &query, body).await
