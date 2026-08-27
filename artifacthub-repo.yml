@@ -1,0 +1,7 @@
+# Artifact Hub repository metadata for the breezy-registry chart repo.
+# After adding https://breezycourses.github.io/registry on artifacthub.io,
+# paste the repository ID it generates here to become a verified publisher.
+# repositoryID: <from the artifacthub.io control panel>
+owners:
+  - name: breezycourses
+    email: subhamktech@gmail.com
