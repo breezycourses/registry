@@ -10,6 +10,38 @@ entries:
         - name: Container image
           url: https://github.com/breezycourses/registry/pkgs/container/registry
     apiVersion: v2
+    appVersion: 0.1.1
+    created: "2026-08-27T02:38:54.791749045Z"
+    description: A single-binary OCI container registry with a web UI, access control,
+      S3/R2-backed storage, and safe online GC.
+    digest: d54bbdbb3581bf501e4a65ea58ad575390bf21503e73774e43a49f28b8e4bdba
+    home: https://github.com/breezycourses/registry
+    icon: https://raw.githubusercontent.com/breezycourses/registry/main/assets/icon.png
+    keywords:
+    - registry
+    - oci
+    - docker
+    - containers
+    - helm
+    maintainers:
+    - name: breezycourses
+      url: https://github.com/breezycourses
+    name: breezy-registry
+    sources:
+    - https://github.com/breezycourses/registry
+    type: application
+    urls:
+    - https://github.com/breezycourses/registry/releases/download/breezy-registry-0.1.1/breezy-registry-0.1.1.tgz
+    version: 0.1.1
+  - annotations:
+      artifacthub.io/category: integration-delivery
+      artifacthub.io/license: Apache-2.0
+      artifacthub.io/links: |
+        - name: Documentation
+          url: https://github.com/breezycourses/registry#readme
+        - name: Container image
+          url: https://github.com/breezycourses/registry/pkgs/container/registry
+    apiVersion: v2
     appVersion: 0.1.0
     created: "2026-08-27T01:57:04.124100373Z"
     description: A single-binary OCI container registry with a web UI, access control,
@@ -33,4 +65,4 @@ entries:
     urls:
     - https://github.com/breezycourses/registry/releases/download/breezy-registry-0.1.0/breezy-registry-0.1.0.tgz
     version: 0.1.0
-generated: "2026-08-27T01:57:04.124106724Z"
+generated: "2026-08-27T02:38:54.791755062Z"
