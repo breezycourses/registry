@@ -1,0 +1,98 @@
+image:
+  repository: ghcr.io/breezy/breezy-registry
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Only takes effect when sharding.enabled=true; a plain install is always 1 replica
+# (SQLite has a single writer — scale out with sharding, not replicas).
+replicaCount: 1
+
+sharding:
+  # Runs replicaCount independent shards. Repositories are assigned to shards by
+  # rendezvous hashing; a shard answers 307 for repos it doesn't own. Redirect
+  # targets are in-cluster pod DNS names, so sharded mode is for in-cluster
+  # clients (CI, tooling). For external/kubelet traffic, route at the ingress
+  # or keep a single shard.
+  enabled: false
+
+config:
+  publicPull: true
+  gcGraceSeconds: 3600
+
+# The admin dashboard served at /. Disable for a headless registry
+# (the /v2 and /api/v1 surfaces are unaffected).
+ui:
+  enabled: true
+
+# Object storage as the source of truth (recommended for production). Blobs,
+# manifests, and each repo's CAS'd index live in the bucket; the pod's disk and
+# SQLite become rebuildable caches — pods are disposable, replicas of the same
+# data need no coordination, and losing a PVC loses nothing.
+objectStorage:
+  enabled: false
+  endpoint: ""            # e.g. https://s3.us-east-1.amazonaws.com or in-cluster MinIO
+  bucket: "breezy"
+  region: "us-east-1"
+  # Name of a Secret with AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY keys,
+  # injected as env vars (IRSA / workload identity also works — leave empty).
+  credentialsSecret: ""
+
+# Users for the registry. Generate password hashes with:
+#   breezy-registry hash-password <password>
+# An empty list means OPEN MODE (no auth) — fine for a lab, not for production.
+users: []
+#  - username: admin
+#    password: "$argon2id$..."
+#    role: admin        # pull | push | admin
+#  - username: ci
+#    password: "$argon2id$..."
+#    role: push
+
+# Name of an existing Secret with a `breezy.toml` key, if you manage the config
+# yourself (e.g. via sealed-secrets / external-secrets). Overrides everything above.
+existingConfigSecret: ""
+
+persistence:
+  enabled: true
+  size: 20Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+
+service:
+  type: ClusterIP
+  port: 5100
+
+ingress:
+  enabled: false
+  className: ""
+  host: registry.example.com
+  # Registries stream multi-GB blobs; keep body-size limits off.
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+  # TLS is the ingress's job — the pod itself serves plain HTTP.
+  tls: []
+  #  - secretName: registry-tls
+  #    hosts: [registry.example.com]
+
+resources: {}
+#  requests: { cpu: 100m, memory: 128Mi }
+#  limits: { memory: 512Mi }
+
+podSecurityContext:
+  fsGroup: 65532
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+extraEnv: []

@@ -1,0 +1,33 @@
+breezy-registry {{ .Chart.AppVersion }} deployed.
+
+{{- if .Values.ingress.enabled }}
+
+Registry URL: https://{{ .Values.ingress.host }}
+  docker login {{ .Values.ingress.host }}
+  docker push {{ .Values.ingress.host }}/team/app:v1
+{{- if .Values.ui.enabled }}
+Admin dashboard: https://{{ .Values.ingress.host }}/
+{{- else }}
+Admin dashboard: disabled (ui.enabled=false — headless registry)
+{{- end }}
+{{- else }}
+
+No ingress enabled. Reach it in-cluster at:
+  {{ include "breezy-registry.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+or locally with:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "breezy-registry.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+{{- end }}
+
+{{- if not .Values.users }}
+
+WARNING: no users configured — the registry is in OPEN MODE (anyone can push).
+Add users to values.yaml; hash passwords with:
+  breezy-registry hash-password <password>
+{{- end }}
+
+{{- if .Values.sharding.enabled }}
+
+Sharding: {{ .Values.replicaCount }} independent shards. In-cluster clients may hit
+any shard and will be redirected (HTTP 307) to the repository's owner.
+Scaling replicaCount reassigns ~1/N of repositories — drain/copy before shrinking.
+{{- end }}

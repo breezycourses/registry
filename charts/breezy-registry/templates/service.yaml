@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "breezy-registry.fullname" . }}
+  labels:
+    {{- include "breezy-registry.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+  selector:
+    {{- include "breezy-registry.selectorLabels" . | nindent 4 }}
+---
+# Headless service: gives StatefulSet pods stable DNS names, which sharded mode
+# uses as redirect targets.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "breezy-registry.headlessService" . }}
+  labels:
+    {{- include "breezy-registry.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+  selector:
+    {{- include "breezy-registry.selectorLabels" . | nindent 4 }}

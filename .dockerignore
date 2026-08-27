@@ -1,0 +1,6 @@
+target
+data
+charts
+tests
+*.md
+.git
