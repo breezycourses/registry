@@ -8,7 +8,7 @@ RUN bun run build
 
 # rust:alpine targets musl, so the release binary is fully static.
 FROM rust:1-alpine AS build
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev ca-certificates
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -16,6 +16,7 @@ COPY --from=ui /ui/dist ./ui/dist
 RUN cargo build --release
 
 FROM scratch
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /src/target/release/breezy-registry /breezy-registry
 ENV BREEZY_LISTEN=0.0.0.0:5100 \
     BREEZY_DATA_DIR=/data

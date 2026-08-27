@@ -2,8 +2,8 @@ apiVersion: v2
 name: breezy-registry
 description: A single-binary OCI container registry with a web UI, access control, S3/R2-backed storage, and safe online GC.
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.1.1
+appVersion: "0.1.1"
 home: https://github.com/breezycourses/registry
 sources:
   - https://github.com/breezycourses/registry
