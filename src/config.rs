@@ -26,6 +26,51 @@ pub struct Config {
     /// become rebuildable caches.
     #[serde(default)]
     pub object_storage: Option<ObjectStorageCfg>,
+    /// Policy-driven tag expiry; see retention.rs. Off unless configured:
+    /// deletion has to be something the operator asked for by name.
+    #[serde(default)]
+    pub retention: RetentionCfg,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetentionCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds between sweeps. The first sweep runs one interval after boot,
+    /// so a crash loop cannot become a sweep loop.
+    #[serde(default = "default_retention_interval")]
+    pub interval_seconds: i64,
+    /// SHA tags outside this many newest survive only via the other rules.
+    #[serde(default = "default_keep_newest")]
+    pub keep_newest: usize,
+    /// Nothing pushed within this many days is deleted, whatever its rank.
+    #[serde(default = "default_keep_days")]
+    pub keep_days: i64,
+    /// Only matching tags are candidates. The default is a bare 40-hex commit
+    /// SHA — what CI mints mechanically and nobody types by hand.
+    #[serde(default = "default_tag_pattern")]
+    pub tag_pattern: String,
+    /// Exact `repo:tag` pins for what only the operator can know — e.g. a
+    /// deployment frozen on a build older than every automatic window.
+    #[serde(default)]
+    pub protect: Vec<String>,
+    /// Run a GC pass after each sweep, so the bytes leave with the tags.
+    #[serde(default = "default_true")]
+    pub run_gc: bool,
+}
+
+impl Default for RetentionCfg {
+    fn default() -> Self {
+        RetentionCfg {
+            enabled: false,
+            interval_seconds: default_retention_interval(),
+            keep_newest: default_keep_newest(),
+            keep_days: default_keep_days(),
+            tag_pattern: default_tag_pattern(),
+            protect: vec![],
+            run_gc: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,6 +124,18 @@ fn default_grace() -> i64 {
 fn default_role() -> String {
     "push".into()
 }
+fn default_retention_interval() -> i64 {
+    86_400
+}
+fn default_keep_newest() -> usize {
+    10
+}
+fn default_keep_days() -> i64 {
+    2
+}
+fn default_tag_pattern() -> String {
+    r"^[0-9a-f]{40}$".into()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -91,6 +148,7 @@ impl Default for Config {
             ui: true,
             sharding: None,
             object_storage: None,
+            retention: RetentionCfg::default(),
         }
     }
 }

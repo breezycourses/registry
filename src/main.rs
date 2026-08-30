@@ -3,11 +3,12 @@ mod auth;
 mod config;
 mod db;
 mod gc;
+mod objectstore;
 mod oci;
+mod retention;
 mod schema;
 mod shard;
 mod storage;
-mod objectstore;
 mod truth;
 
 use axum::extract::DefaultBodyLimit;
@@ -24,7 +25,8 @@ pub struct App {
     pub object: Option<Arc<dyn objectstore::ObjectStore>>,
     /// Per-repo write serialization within this process (cross-process safety
     /// comes from CAS on the bucket, this just avoids needless conflicts).
-    pub repo_locks: tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub repo_locks:
+        tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 pub type AppRef = Arc<App>;
@@ -181,6 +183,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tokio::spawn(upload_sweeper(app.clone()));
+    if app.cfg.retention.enabled {
+        // Refuse to boot on a pattern that does not parse, rather than let a
+        // typo silently disable the policy the config says is on.
+        if let Err(e) = regex::Regex::new(&app.cfg.retention.tag_pattern) {
+            eprintln!("invalid retention.tag_pattern: {e}");
+            std::process::exit(1);
+        }
+        tokio::spawn(retention::retention_loop(app.clone()));
+    }
 
     let router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -191,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/repos", get(api::repos))
         .route("/api/v1/tags", get(api::tags))
         .route("/api/v1/gc", post(api::gc_run))
+        .route("/api/v1/retention", post(api::retention_run))
         .route("/api/v1/stats", get(api::stats));
     let router = if app.cfg.ui {
         router.fallback(get(ui_assets))
@@ -198,7 +210,10 @@ async fn main() -> anyhow::Result<()> {
         router
     };
     let router = router
-        .layer(middleware::from_fn_with_state(app.clone(), auth::middleware))
+        .layer(middleware::from_fn_with_state(
+            app.clone(),
+            auth::middleware,
+        ))
         .layer(DefaultBodyLimit::disable())
         .with_state(app.clone());
 

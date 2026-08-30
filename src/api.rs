@@ -1,18 +1,15 @@
 use crate::auth::{authorize, Action, Identity, Role};
 use crate::db;
-use crate::gc;
 use crate::oci::errors::internal;
 use crate::AppRef;
+use crate::{gc, retention};
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Json, Response};
 use axum::Extension;
 use diesel::prelude::*;
 use std::collections::HashMap;
 
-pub async fn whoami(
-    State(_app): State<AppRef>,
-    Extension(id): Extension<Identity>,
-) -> Response {
+pub async fn whoami(State(_app): State<AppRef>, Extension(id): Extension<Identity>) -> Response {
     let role = match id.role {
         Role::Admin => "admin",
         Role::Push => "push",
@@ -22,14 +19,15 @@ pub async fn whoami(
     Json(serde_json::json!({ "username": id.username, "role": role })).into_response()
 }
 
-pub async fn stats(
-    State(app): State<AppRef>,
-    Extension(id): Extension<Identity>,
-) -> Response {
+pub async fn stats(State(app): State<AppRef>, Extension(id): Extension<Identity>) -> Response {
     if let Err(resp) = authorize(&app, &id, Action::Pull) {
         return resp;
     }
-    let mode = if app.object.is_some() { "object" } else { "local" };
+    let mode = if app.object.is_some() {
+        "object"
+    } else {
+        "local"
+    };
     let result = db::run(&app.pool, move |conn| {
         use crate::schema::{blobs as b, manifests as m, repos as rp, tags as t};
         use diesel::dsl::count_star;
@@ -38,9 +36,9 @@ pub async fn stats(
         let manifests: i64 = m::table.select(count_star()).get_result(conn)?;
         let blobs: i64 = b::table.select(count_star()).get_result(conn)?;
         let storage: Option<i64> = b::table
-            .select(diesel::dsl::sql::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>>(
-                "SUM(size)",
-            ))
+            .select(diesel::dsl::sql::<
+                diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
+            >("SUM(size)"))
             .get_result(conn)?;
         Ok(serde_json::json!({
             "repos": repos,
@@ -60,10 +58,7 @@ pub async fn stats(
     }
 }
 
-pub async fn repos(
-    State(app): State<AppRef>,
-    Extension(id): Extension<Identity>,
-) -> Response {
+pub async fn repos(State(app): State<AppRef>, Extension(id): Extension<Identity>) -> Response {
     if let Err(resp) = authorize(&app, &id, Action::Pull) {
         return resp;
     }
@@ -206,6 +201,29 @@ pub async fn gc_run(
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
     match gc::run(&app, dry_run).await {
+        Ok(report) => Json(serde_json::json!(report)).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+/// One retention sweep, on demand. The manual counterpart of the loop the
+/// config schedules — and usable with the loop off, for operators who would
+/// rather own the schedule (a CronJob, a CI step) than run a policy daemon.
+/// `dry_run` reports the victims without touching anything, which is the
+/// intended first call after writing a policy.
+pub async fn retention_run(
+    State(app): State<AppRef>,
+    Extension(id): Extension<Identity>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(resp) = authorize(&app, &id, Action::Admin) {
+        return resp;
+    }
+    let dry_run = params
+        .get("dry_run")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    match retention::run(&app, dry_run).await {
         Ok(report) => Json(serde_json::json!(report)).into_response(),
         Err(e) => internal(e),
     }
