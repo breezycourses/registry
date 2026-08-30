@@ -173,9 +173,40 @@ cargo build
 
 `tests/e2e.sh` honors `REG=host:port` and `AUTH="-u user:pass"`.
 
+## Retention
+
+GC collects whatever the tags cannot reach; retention is the policy that decides
+a tagged image has outlived its usefulness. Off unless configured — a registry
+must not start deleting images because it was upgraded:
+
+```toml
+[retention]
+enabled = true
+interval_seconds = 86400    # first sweep runs one interval after boot
+keep_newest = 10            # rollback window, per repository
+keep_days = 2               # nothing this recent is deleted, whatever its rank
+tag_pattern = "^[0-9a-f]{40}$"   # only matching tags are ever candidates
+protect = ["team/app:<sha>"]     # exact repo:tag pins the operator knows about
+run_gc = true               # sweep ends with one GC pass
+```
+
+Only tags matching `tag_pattern` are candidates — the default is a bare 40-hex
+commit SHA, the shape CI mints on every push; `latest`, semver, and anything a
+human named are untouchable. Within the candidates a tag survives the newest-N
+window, the recency window, or an explicit `protect` pin; the rules are keeps,
+not deletes, so ambiguity fails toward keeping. `POST /api/v1/retention`
+(admin) runs a sweep on demand, and `?dry_run=true` reports the victims without
+touching anything — the intended first call after writing a policy. Operators
+who would rather own the schedule can leave `enabled = false` and drive the
+endpoint from cron.
+
+Untagged manifests younger than `gc_grace_seconds` are collected by a later
+sweep rather than the one that untagged them; the grace window applies to
+retention's GC pass like any other.
+
 ## Not yet built (deliberately)
 
-OIDC SSO + CLI secrets, retention policy rules, project quotas, per-project ACLs
+OIDC SSO + CLI secrets, project quotas, per-project ACLs
 (roles are currently registry-wide), vulnerability scanning, a UI view over the
 provenance log. Postgres is deliberately off the roadmap — object mode plus
 disposable replicas is the scaling path. The schema and the four abstractions
