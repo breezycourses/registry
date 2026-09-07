@@ -54,6 +54,22 @@ check "PUT finalize" 201 "$(code -X PUT "http://$REG$LOC?digest=$LAYER_DIGEST")"
 curl -s $AUTH "http://$REG/v2/team/app/blobs/$LAYER_DIGEST" > "$TMP/layer.out"
 check "blob round-trips" "$LAYER_DIGEST" "$(digest_of "$TMP/layer.out")"
 
+### full-body PATCH retried against a session with stale staged bytes, no
+### Content-Range (e.g. Docker retrying an interrupted monolithic blob push
+### from scratch) must not silently concatenate onto the stale bytes
+head -c 500000 /dev/urandom > "$TMP/retry.bin"
+RETRY_DIGEST=$(digest_of "$TMP/retry.bin")
+RETRY_LOC=$(curl -s -D - -o /dev/null $AUTH -X POST "http://$REG/v2/team/app/blobs/uploads/" \
+  | awk 'tolower($1)=="location:" {print $2}' | tr -d '\r')
+head -c 250000 "$TMP/retry.bin" > "$TMP/retry_partial"
+check "PATCH partial (simulated interrupted attempt)" 202 "$(code -X PATCH \
+  --data-binary @"$TMP/retry_partial" "http://$REG$RETRY_LOC")"
+check "PATCH full retry, no Content-Range" 202 "$(code -X PATCH \
+  --data-binary @"$TMP/retry.bin" "http://$REG$RETRY_LOC")"
+check "PUT finalize after retry (not corrupted)" 201 "$(code -X PUT "http://$REG$RETRY_LOC?digest=$RETRY_DIGEST")"
+curl -s $AUTH "http://$REG/v2/team/app/blobs/$RETRY_DIGEST" > "$TMP/retry.out"
+check "retried blob round-trips" "$RETRY_DIGEST" "$(digest_of "$TMP/retry.out")"
+
 ### percent-encoded digest accepted (crane/go clients encode the colon)
 echo -n '{"enc":"test"}' > "$TMP/enc.json"
 ENC_DIGEST=$(digest_of "$TMP/enc.json")

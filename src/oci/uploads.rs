@@ -152,7 +152,7 @@ pub async fn patch(
     if let Err(resp) = authorize(app, id, Action::Push) {
         return resp;
     }
-    let received = match session(app, uuid).await {
+    let mut received = match session(app, uuid).await {
         Ok(Some(n)) => n,
         Ok(None) => return upload_unknown(),
         Err(e) => return internal(e),
@@ -172,6 +172,22 @@ pub async fn patch(
                 .insert("range", format!("0-{end}").parse().unwrap());
             return resp;
         }
+    } else if received > 0 {
+        // No Content-Range, but this session already has staged bytes. A
+        // well-behaved chunked client always sends Content-Range on every
+        // chunk after the first, so this means the client is instead
+        // re-sending the *entire* blob in one shot against a session it
+        // already (partially) used -- e.g. retrying a monolithic PATCH after
+        // a connection drop or a registry restart orphaned the first
+        // attempt mid-transfer. Blindly appending would silently concatenate
+        // the new stream onto the stale bytes and corrupt the blob (it would
+        // never match the expected digest, and the client has no way to
+        // detect or recover from this on its own). Treat it as a fresh
+        // attempt instead.
+        if let Err(e) = app.store.create_staging(uuid).await {
+            return internal(e);
+        }
+        received = 0;
     }
 
     let staging = app.store.staging_path(uuid);
