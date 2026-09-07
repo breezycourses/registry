@@ -90,7 +90,17 @@ One process, three API surfaces:
 ```toml
 listen = "0.0.0.0:5100"
 data_dir = "./data"
-public_pull = true        # anonymous pulls allowed
+public_pull = true        # anonymous pulls allowed (blobs/manifests/tags need no credential)
+# Note: once any [[users]] are configured, an anonymous `GET /v2/` always
+# answers 401 + `WWW-Authenticate: Basic`, even with public_pull. That is how
+# docker/crane/containerd learn to send credentials on the push path -- docker
+# in particular only registers the challenge from a 401 there and otherwise
+# never authenticates, so every push would fail. containerd and crane still
+# pull public content anonymously (they don't need /v2/ to succeed, and
+# proceed without credentials after a Basic challenge). The Docker *CLI* is
+# the one client that refuses to continue anonymously after a Basic
+# challenge ("no basic auth credentials"), so `docker pull` of public content
+# needs a `docker login` with a pull-role user.
 gc_grace_seconds = 3600   # GC never touches anything younger than this
 
 [[users]]

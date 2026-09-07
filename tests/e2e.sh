@@ -28,6 +28,15 @@ trap 'rm -rf "$TMP"' EXIT
 
 ### base
 check "GET /v2/" 200 "$(code "http://$REG/v2/")"
+# With users configured, an anonymous /v2/ must issue the Basic challenge:
+# docker only registers a challenge from a 401 here and never sends
+# credentials on later requests without one, so a 200 (even under
+# public_pull) makes every push fail on its first blob POST.
+if [ -n "$AUTH" ]; then
+  check "anonymous GET /v2/ challenges" 401 "$(curl -s -o /dev/null -w "%{http_code}" "http://$REG/v2/")"
+  check "anonymous GET /v2/ advertises Basic" "yes" "$(curl -s -I "http://$REG/v2/" \
+    | grep -qi '^www-authenticate: Basic' && echo yes || echo no)"
+fi
 
 ### blobs — monolithic single-POST
 echo -n '{"arch":"amd64","os":"linux"}' > "$TMP/config.json"

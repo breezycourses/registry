@@ -207,6 +207,18 @@ pub async fn handle(State(app): State<AppRef>, req: Request) -> Response {
 
     match (route, method) {
         (Route::Base, Method::GET) | (Route::Base, Method::HEAD) => {
+            // The version check doubles as the auth-scheme advertisement.
+            // Docker (and the other distribution clients) only register a
+            // Basic challenge from a 401 *here*, and then never attach
+            // credentials to any later request without one -- so under
+            // public_pull, where anonymous pulls are otherwise allowed, this
+            // endpoint has to issue the challenge explicitly or every push
+            // fails on its first blob POST with `unauthorized`. Anonymous
+            // pulls keep working: clients proceed unauthenticated after a
+            // Basic challenge when they hold no credentials.
+            if !app.cfg.users.is_empty() && identity.username.is_none() {
+                return crate::auth::challenge();
+            }
             if let Err(resp) = authorize(&app, &identity, Action::Pull) {
                 return resp;
             }
