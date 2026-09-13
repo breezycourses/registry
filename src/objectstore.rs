@@ -22,6 +22,17 @@ pub enum Cas {
     Conflict,
 }
 
+/// One object under a `list` prefix. `modified` exists for GC's grace window:
+/// a push puts a blob object down before the index CAS that makes it visible,
+/// so recency is the only safe line between garbage and in-flight content.
+#[derive(Debug)]
+pub struct Listed {
+    pub key: String,
+    /// Unix seconds.
+    pub modified: i64,
+    pub size: i64,
+}
+
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     async fn get(&self, key: &str) -> anyhow::Result<Option<(Vec<u8>, String)>>;
@@ -32,8 +43,12 @@ pub trait ObjectStore: Send + Sync {
     async fn put_if_match(&self, key: &str, bytes: &[u8], etag: Option<&str>)
         -> anyhow::Result<Cas>;
     async fn head(&self, key: &str) -> anyhow::Result<bool>;
+    /// Last-modified as unix seconds, or None if the key doesn't exist. The
+    /// delete-time freshness check: a listing's mtime goes stale the moment an
+    /// object is rewritten, so re-stat before reclaiming it.
+    async fn stat(&self, key: &str) -> anyhow::Result<Option<i64>>;
     async fn delete(&self, key: &str) -> anyhow::Result<()>;
-    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>>;
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<Listed>>;
     async fn put_file(&self, key: &str, path: &Path) -> anyhow::Result<()>;
     /// Returns false if the key doesn't exist.
     async fn get_to_file(&self, key: &str, path: &Path) -> anyhow::Result<bool>;
@@ -186,6 +201,23 @@ impl ObjectStore for FsObjectStore {
         self.blocking(move |s| Ok(s.path_of(&key).exists())).await
     }
 
+    async fn stat(&self, key: &str) -> anyhow::Result<Option<i64>> {
+        let key = key.to_string();
+        self.blocking(move |s| {
+            match std::fs::metadata(s.path_of(&key)) {
+                Ok(m) => Ok(m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| Some(d.as_secs() as i64))
+                    .unwrap_or(Some(0))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
+    }
+
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
         let key = key.to_string();
         self.blocking(move |s| {
@@ -201,7 +233,7 @@ impl ObjectStore for FsObjectStore {
         .await
     }
 
-    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<Listed>> {
         let prefix = prefix.to_string();
         self.blocking(move |s| {
             let mut out = vec![];
@@ -223,7 +255,18 @@ impl ObjectStore for FsObjectStore {
                         && !fname.ends_with(".__lock")
                     {
                         if let Ok(rel) = path.strip_prefix(&base) {
-                            out.push(rel.to_string_lossy().to_string());
+                            let meta = entry.metadata()?;
+                            let modified = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            out.push(Listed {
+                                key: rel.to_string_lossy().to_string(),
+                                modified,
+                                size: meta.len() as i64,
+                            });
                         }
                     }
                 }
@@ -386,6 +429,14 @@ impl ObjectStore for S3Store {
         }
     }
 
+    async fn stat(&self, key: &str) -> anyhow::Result<Option<i64>> {
+        match self.inner.head(&opath(key)).await {
+            Ok(m) => Ok(Some(m.last_modified.timestamp())),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
         match self.inner.delete(&opath(key)).await {
             Ok(_) | Err(object_store::Error::NotFound { .. }) => Ok(()),
@@ -393,11 +444,18 @@ impl ObjectStore for S3Store {
         }
     }
 
-    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<Listed>> {
         use futures_util::TryStreamExt;
         let prefix = opath(prefix.trim_end_matches('/'));
         let items: Vec<_> = self.inner.list(Some(&prefix)).try_collect().await?;
-        Ok(items.into_iter().map(|m| m.location.to_string()).collect())
+        Ok(items
+            .into_iter()
+            .map(|m| Listed {
+                key: m.location.to_string(),
+                modified: m.last_modified.timestamp(),
+                size: m.size as i64,
+            })
+            .collect())
     }
 
     async fn put_file(&self, key: &str, path: &Path) -> anyhow::Result<()> {

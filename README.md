@@ -130,8 +130,23 @@ for local development only. Plaintext passwords work but log a warning; use
 `POST /api/v1/gc?dry_run=1` (admin), or the buttons in the UI. Mark & sweep over
 the DB: a manifest survives if it is tagged, referenced by a surviving index, or
 is a referrer (e.g. a signature) of a surviving manifest. Blobs survive while any
-surviving manifest references them. Nothing younger than `gc_grace_seconds` is
-ever deleted, which makes GC safe to run while pushes are in flight.
+surviving manifest references them. In object mode the sweep also lists the
+bucket: objects under `manifests/` and `blobs/` that no repo index accounts for —
+abandoned uploads, manifest objects whose index write was rejected, deletes that
+failed mid-sweep — are reclaimed too, but only after a previous sweep has
+marked them in `gc/pending.json`, a small CAS'd ledger in the bucket itself.
+The ledger is shared precisely because the race is cross-replica: while a
+digest is marked, `blob_exists` answers false on every replica, so no push can
+commit an index reference to a doomed object — the client must re-upload,
+which clears the mark and refreshes the object. Deletion itself is claimed:
+the sweep CAS-moves a mark into `deleting` before touching the object, and a
+rescue that sees the claim waits it out and re-PUTs only after it clears — so
+a rescue's write is always ordered after the delete, on every replica. Each
+delete also re-stats the object and re-checks local index state under the
+claim, all inside the lock pushes hold the read half of. Claims expire after
+60s so a crashed sweep can't wedge a digest. Nothing younger than
+`gc_grace_seconds` is ever deleted, which makes GC safe to run while pushes
+are in flight.
 
 Deleting: `DELETE /v2/<repo>/manifests/<tag>` untags; `DELETE .../manifests/<digest>`
 removes the manifest; GC then reclaims unreferenced blobs.

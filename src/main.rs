@@ -27,6 +27,12 @@ pub struct App {
     /// comes from CAS on the bucket, this just avoids needless conflicts).
     pub repo_locks:
         tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Reference creation vs. orphan reclamation. Pushes hold the read half
+    /// across their blob-existence checks and the index CAS; GC's orphan
+    /// sweep takes the write half for each delete, so a same-replica push
+    /// can never commit a reference between the sweep's last check and the
+    /// object delete. Readers stay parallel with each other.
+    pub gc_lock: tokio::sync::RwLock<()>,
 }
 
 pub type AppRef = Arc<App>;
@@ -171,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
         cfg,
         object,
         repo_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        gc_lock: tokio::sync::RwLock::new(()),
     });
 
     if app.object.is_some() {

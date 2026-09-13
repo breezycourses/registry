@@ -143,8 +143,30 @@ pub async fn put(
     // index is CAS-updated — that PUT is the linearization point.
     if app.object.is_some() {
         let os = app.object.as_ref().unwrap();
+        // Orphan GC reclaims objects no index references; the read half of
+        // gc_lock spans the manifest PUT, the existence checks, AND the index
+        // CAS, so a delete can never slip between "we wrote/saw the object"
+        // and "the index records it" — an object deleted first makes the push
+        // fail closed (MANIFEST_BLOB_UNKNOWN) instead of committing a dangling
+        // reference.
+        let _gc_guard = app.gc_lock.read().await;
         if let Err(e) = os.put(&crate::truth::manifest_key(&digest), &bytes).await {
             return internal(e);
+        }
+        // Same story as blob uploads: the PUT refreshed the object, so any
+        // orphan mark taken against the old bytes no longer applies. If a mark
+        // was cleared, PUT again afterward — a delete already committed
+        // against the old mark must not leave the object missing.
+        match crate::truth::clear_pending(app, &digest).await {
+            Ok(true) => {
+                if let Err(e) =
+                    os.put(&crate::truth::manifest_key(&digest), &bytes).await
+                {
+                    return internal(e);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!("failed to clear orphan mark for {digest}: {e}"),
         }
         for d in &child_blobs {
             match crate::truth::blob_exists(app, d).await {

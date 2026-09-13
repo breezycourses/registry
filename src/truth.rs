@@ -21,6 +21,11 @@ use std::sync::Arc;
 pub fn index_key(repo: &str) -> String {
     format!("repos/{repo}/index.json")
 }
+/// Shared orphan ledger: digest -> first-sighting unix time. Lives in the
+/// bucket (not a replica's SQLite) precisely because deletion safety is a
+/// cross-replica question — a push on any replica must see the mark before it
+/// can adopt the object, and `blob_exists` treats pending digests as absent.
+pub const PENDING_KEY: &str = "gc/pending.json";
 fn log_key(repo: &str, version: i64) -> String {
     format!("repos/{repo}/log/{version:010}.json")
 }
@@ -53,6 +58,30 @@ pub struct TagEntry {
     pub digest: String,
     pub pushed_at: i64,
 }
+
+/// A deletion claim. `owner` fences it: a sweep that stalls past the claim
+/// TTL can have its claim force-cleared by a rescuer, so the owner id is what
+/// the sweep re-checks (renew) immediately before it deletes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Claim {
+    pub at: i64,
+    pub owner: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PendingDoc {
+    #[serde(default)]
+    pub digests: BTreeMap<String, i64>,
+    /// Digests a sweep has claimed for deletion. A claim is the linearization
+    /// point: rescuers that see it wait for it to clear before re-writing the
+    /// object, so their PUT always lands after the delete it guards.
+    #[serde(default)]
+    pub deleting: BTreeMap<String, Claim>,
+}
+
+/// A claim older than this is stale — the sweep holding it died — and may be
+/// force-released by a rescuer or reclaimed by the next sweep's merge.
+pub const CLAIM_TTL_SECS: i64 = 60;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IndexDoc {
@@ -343,8 +372,9 @@ pub async fn rebuild_all(app: &AppRef) -> anyhow::Result<usize> {
     let keys = os.list("repos/").await?;
     let names: Vec<String> = keys
         .iter()
-        .filter_map(|k| {
-            k.strip_prefix("repos/")
+        .filter_map(|e| {
+            e.key
+                .strip_prefix("repos/")
                 .and_then(|k| k.strip_suffix("/index.json"))
                 .map(String::from)
         })
@@ -397,6 +427,22 @@ pub async fn ensure_blob_local(app: &AppRef, digest: &str) -> anyhow::Result<Opt
         Ok(())
     })
     .await?;
+    // This row makes blob_exists answer true, which is license for a push —
+    // on any replica — to reference the object. If it was marked for orphan
+    // collection, that mark has to go first: the row is replica-local, so a
+    // remote replica would still see the mark, and the sweep here checks only
+    // its own DB at delete time. After clearing, re-PUT the object so a
+    // delete already committed against the old mark can't leave the row
+    // pointing at nothing.
+    match clear_pending(app, digest).await {
+        Ok(true) => {
+            if let Err(e) = os.put_file(&blob_key(digest), &app.store.blob_path(digest)).await {
+                tracing::warn!("failed to re-put rescued blob {digest}: {e}");
+            }
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!("failed to clear orphan mark for {digest}: {e}"),
+    }
     Ok(Some(size))
 }
 
@@ -417,7 +463,184 @@ pub async fn blob_exists(app: &AppRef, digest: &str) -> anyhow::Result<bool> {
         return Ok(true);
     }
     match &app.object {
-        Some(os) => os.head(&blob_key(digest)).await,
+        Some(os) => {
+            // A digest marked for orphan collection counts as absent: letting
+            // a push adopt it would dangle when the delete lands, so the
+            // client is made to re-upload (which clears the mark) instead.
+            // Claimed digests count too — the delete may already be in flight.
+            let pending = read_pending(os).await?;
+            if pending.digests.contains_key(digest) || pending.deleting.contains_key(digest) {
+                return Ok(false);
+            }
+            os.head(&blob_key(digest)).await
+        }
         None => Ok(false),
+    }
+}
+
+pub async fn read_pending(
+    os: &Arc<dyn ObjectStore>,
+) -> anyhow::Result<PendingDoc> {
+    match os.get(PENDING_KEY).await? {
+        Some((bytes, _)) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
+        None => Ok(PendingDoc::default()),
+    }
+}
+
+/// CAS-mutate the shared pending ledger, same retry discipline as `mutate`:
+/// concurrent rescues (pushes clearing marks) and concurrent sweeps (marks)
+/// merge by re-reading on conflict rather than losing each other.
+pub async fn update_pending<F>(app: &AppRef, apply: F) -> anyhow::Result<()>
+where
+    F: Fn(&mut PendingDoc),
+{
+    let os = app.object.as_ref().expect("pending requires object mode");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut attempt: u64 = 0;
+    loop {
+        let (mut doc, etag) = match os.get(PENDING_KEY).await? {
+            Some((bytes, etag)) => (
+                serde_json::from_slice::<PendingDoc>(&bytes).unwrap_or_default(),
+                Some(etag),
+            ),
+            None => (PendingDoc::default(), None),
+        };
+        apply(&mut doc);
+        let bytes = serde_json::to_vec(&doc)?;
+        match os.put_if_match(PENDING_KEY, &bytes, etag.as_deref()).await? {
+            Cas::Ok(_) => return Ok(()),
+            Cas::Conflict => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("CAS on {PENDING_KEY} did not converge before deadline");
+                }
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    (attempt * 15).min(200),
+                ))
+                .await;
+            }
+        }
+    }
+}
+
+/// Move a mark into `deleting` — the claim that authorizes the delete.
+/// Returns false when the mark is already gone (a rescue cleared it) or
+/// another sweep holds the claim; in both cases this sweep must not delete.
+pub async fn claim_pending(app: &AppRef, digest: &str, owner: &str) -> anyhow::Result<bool> {
+    let d = digest.to_string();
+    let o = owner.to_string();
+    let claimed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = claimed.clone();
+    update_pending(app, move |doc| {
+        let won = doc.digests.remove(&d).is_some();
+        if won {
+            doc.deleting.insert(
+                d.clone(),
+                Claim { at: db::now(), owner: o.clone() },
+            );
+        }
+        flag.store(won, std::sync::atomic::Ordering::SeqCst);
+    })
+    .await?;
+    Ok(claimed.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// The fencing step: re-establish the claim at the last instant before the
+/// delete. A sweep that stalls past CLAIM_TTL_SECS can have its claim
+/// force-cleared by a rescuer, so "we claimed earlier" is not enough — this
+/// CAS both verifies the claim is still ours and refreshes it, after which no
+/// rescue can clear it until the delete completes. Returns false when the
+/// claim is gone or owned by another sweep: the delete must not run.
+pub async fn renew_pending(app: &AppRef, digest: &str, owner: &str) -> anyhow::Result<bool> {
+    let d = digest.to_string();
+    let o = owner.to_string();
+    let renewed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = renewed.clone();
+    update_pending(app, move |doc| {
+        let ours = doc.deleting.get(&d).is_some_and(|c| c.owner == o);
+        if ours {
+            doc.deleting.insert(
+                d.clone(),
+                Claim { at: db::now(), owner: o.clone() },
+            );
+        }
+        flag.store(ours, std::sync::atomic::Ordering::SeqCst);
+    })
+    .await?;
+    Ok(renewed.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// Release a claim. `relist` puts the digest back in `digests` with a fresh
+/// timestamp — used when the delete was aborted (rewritten object, fresh
+/// reference) so the object's observation window starts over. Only a claim we
+/// still own is touched: another sweep's is left alone.
+pub async fn release_pending(
+    app: &AppRef,
+    digest: &str,
+    owner: &str,
+    relist: bool,
+) -> anyhow::Result<()> {
+    let d = digest.to_string();
+    let o = owner.to_string();
+    update_pending(app, move |doc| {
+        if doc.deleting.get(&d).is_some_and(|c| c.owner == o) {
+            doc.deleting.remove(&d);
+            if relist {
+                doc.digests.insert(d.clone(), db::now());
+            }
+        }
+    })
+    .await
+}
+
+/// Clear a mark because the caller is about to (re)write or locally bless the
+/// object — the mark only makes sense against the object that existed when it
+/// was taken. If a sweep has already claimed the digest, wait the claim out:
+/// the caller's re-PUT must land after that delete, or it can be the very
+/// object the delete removes. Claims older than CLAIM_TTL_SECS are stale (the
+/// sweep died — its own fencing renew will abort its delete) and are
+/// force-cleared. Returns true whenever the digest was marked or claimed at
+/// any point — callers then re-PUT the object, since a completed delete may
+/// have removed it.
+pub async fn clear_pending(app: &AppRef, digest: &str) -> anyhow::Result<bool> {
+    let Some(os) = &app.object else { return Ok(false) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(75);
+    let mut saw_mark = false;
+    loop {
+        let doc = read_pending(os).await?;
+        saw_mark |= doc.digests.contains_key(digest);
+        if let Some(claim) = doc.deleting.get(digest) {
+            saw_mark = true;
+            if db::now() - claim.at < CLAIM_TTL_SECS {
+                if std::time::Instant::now() > deadline {
+                    anyhow::bail!("timed out waiting for orphan claim on {digest}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
+            }
+            // Stale claim — force-cleared by the CAS below.
+        }
+        if !doc.digests.contains_key(digest) && !doc.deleting.contains_key(digest) {
+            // Nothing left to clear. If we waited out a claim, the object may
+            // have been deleted — the caller re-PUTs on `true`.
+            return Ok(saw_mark);
+        }
+        let d = digest.to_string();
+        update_pending(app, move |doc| {
+            doc.digests.remove(&d);
+            // Never release a live claim — the sweep holding it is about to
+            // delete; we wait for it instead. Only a stale claim (a dead
+            // sweep) is safe to clear.
+            if doc
+                .deleting
+                .get(&d)
+                .is_some_and(|c| db::now() - c.at >= CLAIM_TTL_SECS)
+            {
+                doc.deleting.remove(&d);
+            }
+        })
+        .await?;
+        // A live claim may still stand — the apply ran on a doc where it was
+        // already fresh. Loop back to the wait rather than declaring victory.
     }
 }
