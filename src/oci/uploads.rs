@@ -308,6 +308,20 @@ async fn finalize(app: &AppRef, name: &str, uuid: &str, digest: &str) -> Respons
             let _ = app.store.delete(digest).await;
             return internal(e);
         }
+        // The object is freshly written, so any orphan mark taken against the
+        // old one no longer applies — and blob_exists answers false while the
+        // mark stands, which is how clients learn to land here. If a mark was
+        // cleared, re-PUT once more afterward: a delete already committed
+        // against the old mark must not leave the object missing.
+        match crate::truth::clear_pending(app, digest).await {
+            Ok(true) => {
+                if let Err(e) = os.put_file(&crate::truth::blob_key(digest), &local).await {
+                    return internal(e);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!("failed to clear orphan mark for {digest}: {e}"),
+        }
     }
     {
         use crate::schema::blobs as b;

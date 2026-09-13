@@ -64,4 +64,6 @@ diesel::joinable!(tags -> repos (repo_id));
 diesel::joinable!(uploads -> repos (repo_id));
 diesel::joinable!(manifest_refs -> manifests (manifest_id));
 
-diesel::allow_tables_to_appear_in_same_query!(repos, blobs, manifests, manifest_refs, tags, uploads);
+diesel::allow_tables_to_appear_in_same_query!(
+    repos, blobs, manifests, manifest_refs, tags, uploads
+);
