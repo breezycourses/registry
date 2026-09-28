@@ -14,7 +14,11 @@
 //! candidates, the newest `keep_newest` survive (the rollback window), and so
 //! does anything pushed within `keep_days` — recency as an independent guard,
 //! so a burst of pushes cannot age yesterday's rollback target out of the
-//! count-based window.
+//! count-based window — and so does any candidate whose manifest a
+//! non-candidate tag also names: `app:production` pointing at the same
+//! manifest as `app:<sha>` is the operator saying that build is in use, and
+//! the deployment pulls it by the sha, so untagging the sha would leave the
+//! manifest alive and the deployment unable to pull it.
 //!
 //! Off by default. A registry that starts deleting images because it was
 //! upgraded — rather than because its operator wrote a policy — is a data-loss
@@ -39,23 +43,36 @@ pub struct RetentionReport {
     pub gc: Option<gc::GcReport>,
 }
 
+/// One tag of a repository, as retention sees it: its name, when it was
+/// pushed, and the manifest it names.
+pub type TagRow = (String, i64, i64);
+
 /// Which of one repository's tags the policy gives up on.
 ///
 /// Pure, so the policy is testable without a database: `tags` is every tag in
-/// the repo as `(name, pushed_at)`, and the result is the subset to delete.
-/// Everything here is a *keep* rule — a tag survives if ANY rule wants it —
-/// because the failure mode that matters is deleting something needed, and a
-/// disjunction of keeps fails toward keeping.
+/// the repo, and the result is the subset to delete. Everything here is a
+/// *keep* rule — a tag survives if ANY rule wants it — because the failure
+/// mode that matters is deleting something needed, and a disjunction of keeps
+/// fails toward keeping.
 pub fn select_victims(
     repo: &str,
-    tags: &[(String, i64)],
+    tags: &[TagRow],
     now: i64,
     cfg: &RetentionCfg,
     pattern: &regex::Regex,
 ) -> Vec<String> {
-    let mut candidates: Vec<&(String, i64)> = tags
+    // Manifests a non-candidate tag names. A candidate pointing at one is in
+    // use under another name, and whoever pulls it by the candidate's name
+    // (a chart pinned to the sha) must still be able to.
+    let held: HashSet<i64> = tags
         .iter()
-        .filter(|(name, _)| pattern.is_match(name))
+        .filter(|(name, _, _)| !pattern.is_match(name))
+        .map(|(_, _, manifest)| *manifest)
+        .collect();
+
+    let mut candidates: Vec<&TagRow> = tags
+        .iter()
+        .filter(|(name, _, _)| pattern.is_match(name))
         .collect();
     // Newest first; ties broken by name so the order is total and a re-run
     // selects identically.
@@ -65,12 +82,13 @@ pub fn select_victims(
     candidates
         .iter()
         .enumerate()
-        .filter(|(i, (name, pushed))| {
+        .filter(|(i, (name, pushed, manifest))| {
             *i >= cfg.keep_newest
                 && *pushed < cutoff
+                && !held.contains(manifest)
                 && !cfg.protect.iter().any(|p| p == &format!("{repo}:{name}"))
         })
-        .map(|(_, (name, _))| name.clone())
+        .map(|(_, (name, _, _))| name.clone())
         .collect()
 }
 
@@ -94,18 +112,18 @@ pub async fn run(app: &AppRef, dry_run: bool) -> anyhow::Result<RetentionReport>
         crate::truth::rebuild_all(app).await?;
     }
 
-    let all: Vec<(String, String, i64)> = db::run(&app.pool, move |conn| {
+    let all: Vec<(String, String, i64, i64)> = db::run(&app.pool, move |conn| {
         use crate::schema::{repos as rp, tags as t};
         Ok(t::table
             .inner_join(rp::table.on(rp::id.eq(t::repo_id)))
-            .select((rp::name, t::name, t::pushed_at))
+            .select((rp::name, t::name, t::pushed_at, t::manifest_id))
             .load(conn)?)
     })
     .await?;
 
-    let mut by_repo: HashMap<String, Vec<(String, i64)>> = HashMap::new();
-    for (repo, tag, pushed) in all {
-        by_repo.entry(repo).or_default().push((tag, pushed));
+    let mut by_repo: HashMap<String, Vec<TagRow>> = HashMap::new();
+    for (repo, tag, pushed, manifest) in all {
+        by_repo.entry(repo).or_default().push((tag, pushed, manifest));
     }
 
     let now = db::now();
@@ -223,6 +241,12 @@ mod tests {
         format!("{:040x}", n)
     }
 
+    /// A tag on its own manifest, numbered after it, so no two collide
+    /// unless a test builds a shared one on purpose.
+    fn tag(name: impl Into<String>, pushed: i64, manifest: i64) -> (String, i64, i64) {
+        (name.into(), pushed, manifest)
+    }
+
     const DAY: i64 = 86_400;
     const NOW: i64 = 1_000 * DAY;
 
@@ -233,8 +257,8 @@ mod tests {
     #[test]
     fn keeps_the_newest_n_and_deletes_the_rest() {
         // 5 old SHA tags, newest-2 window, no recency rescue.
-        let tags: Vec<(String, i64)> = (0..5)
-            .map(|i| (sha(i), NOW - 30 * DAY + i as i64))
+        let tags: Vec<TagRow> = (0..5)
+            .map(|i| tag(sha(i), NOW - 30 * DAY + i as i64, i as i64))
             .collect();
         let c = cfg(2, 2, vec![]);
         let victims = select_victims("team/app", &tags, NOW, &c, &re(&c));
@@ -248,7 +272,7 @@ mod tests {
     fn recency_rescues_beyond_the_count_window() {
         // Ten tags pushed an hour ago: all inside keep_days, none deleted even
         // though keep_newest is 1. A merge burst must not eat its own tail.
-        let tags: Vec<(String, i64)> = (0..10).map(|i| (sha(i), NOW - 3_600)).collect();
+        let tags: Vec<TagRow> = (0..10).map(|i| tag(sha(i), NOW - 3_600, i as i64)).collect();
         let c = cfg(1, 2, vec![]);
         assert!(select_victims("team/app", &tags, NOW, &c, &re(&c)).is_empty());
     }
@@ -256,9 +280,9 @@ mod tests {
     #[test]
     fn human_named_tags_are_never_candidates() {
         let tags = vec![
-            ("latest".to_string(), NOW - 100 * DAY),
-            ("v1.2.3".to_string(), NOW - 100 * DAY),
-            (sha(1), NOW - 100 * DAY),
+            tag("latest", NOW - 100 * DAY, 10),
+            tag("v1.2.3", NOW - 100 * DAY, 11),
+            tag(sha(1), NOW - 100 * DAY, 1),
         ];
         // keep_newest 0: even with no rollback window, only the SHA is up for
         // deletion — deleting `latest` would take the tag every deploy pulls.
@@ -271,8 +295,8 @@ mod tests {
     fn protect_pins_a_tag_the_policy_would_take() {
         // The case only the operator can know: a deployment frozen on an old
         // build whose tag has aged out of every automatic window.
-        let tags: Vec<(String, i64)> = (0..5)
-            .map(|i| (sha(i), NOW - 30 * DAY + i as i64))
+        let tags: Vec<TagRow> = (0..5)
+            .map(|i| tag(sha(i), NOW - 30 * DAY + i as i64, i as i64))
             .collect();
         let c = cfg(1, 2, vec![format!("team/app:{}", sha(0))]);
         let victims = select_victims("team/app", &tags, NOW, &c, &re(&c));
@@ -283,10 +307,41 @@ mod tests {
     }
 
     #[test]
+    fn an_alias_keeps_the_sha_tag_of_its_manifest() {
+        // The deploy story: `production` is a second name for the manifest
+        // sha(0) names, an old build every other window has given up on. The
+        // chart pulls it by the sha, so the sha must stay; its neighbours
+        // with no alias still go.
+        let mut tags: Vec<TagRow> = (0..5)
+            .map(|i| tag(sha(i), NOW - 30 * DAY + i as i64, i as i64))
+            .collect();
+        tags.push(tag("production", NOW - 30 * DAY, 0));
+        let c = cfg(1, 2, vec![]);
+        let victims = select_victims("team/app", &tags, NOW, &c, &re(&c));
+        assert!(!victims.contains(&sha(0)));
+        assert!(!victims.contains(&"production".to_string()));
+        assert_eq!(victims, vec![sha(3), sha(2), sha(1)]);
+    }
+
+    #[test]
+    fn a_shared_manifest_between_two_candidates_rescues_neither() {
+        // Two sha tags on one manifest (a re-push of an identical build) hold
+        // each other up no more than one would: only an alias counts.
+        let tags = vec![
+            tag(sha(0), NOW - 30 * DAY, 0),
+            tag(sha(1), NOW - 30 * DAY + 1, 0),
+            tag(sha(2), NOW - 30 * DAY + 2, 2),
+        ];
+        let c = cfg(1, 2, vec![]);
+        let victims = select_victims("team/app", &tags, NOW, &c, &re(&c));
+        assert_eq!(victims, vec![sha(1), sha(0)]);
+    }
+
+    #[test]
     fn selection_is_deterministic_under_equal_timestamps() {
         // Same pushed_at everywhere: the name tiebreak makes two runs agree on
         // which tags sit inside the newest-N window.
-        let tags: Vec<(String, i64)> = (0..6).map(|i| (sha(i), NOW - 30 * DAY)).collect();
+        let tags: Vec<TagRow> = (0..6).map(|i| tag(sha(i), NOW - 30 * DAY, i as i64)).collect();
         let c = cfg(3, 2, vec![]);
         let a = select_victims("team/app", &tags, NOW, &c, &re(&c));
         let b = select_victims("team/app", &tags, NOW, &c, &re(&c));
