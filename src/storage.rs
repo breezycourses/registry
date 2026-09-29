@@ -42,6 +42,7 @@ impl Store {
     pub async fn commit(&self, uuid: &str, digest: &str) -> std::io::Result<u64> {
         let src = self.staging_path(uuid);
         let dst = self.blob_path(digest);
+        let digest = digest.to_string();
         let size = tokio::fs::metadata(&src).await?.len();
         if let Some(parent) = dst.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -58,14 +59,27 @@ impl Store {
                 // by path (utimensat), which needs ownership, not write
                 // permission, so a read-only cache is fine. If the file
                 // vanished since the check the sweep took it: rename ours in.
-                // The staged bytes are never used to replace an existing
-                // file — a read-through fill hasn't verified them.
+                // Any other failure (a file we don't own, say) falls back to
+                // replacing it — but only with bytes proven to match the
+                // digest, because a read-through fill's staged copy is
+                // unverified and a bad bucket response must never overwrite
+                // a good cached blob.
                 match touch(&dst) {
                     Ok(()) => std::fs::remove_file(&src)?,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         std::fs::rename(&src, &dst)?
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        if sha256_of_file(&src)? == digest {
+                            std::fs::rename(&src, &dst)?;
+                        } else {
+                            let _ = std::fs::remove_file(&src);
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("cannot refresh {}: {e}; staged bytes do not match {digest}", dst.display()),
+                            ));
+                        }
+                    }
                 }
             } else {
                 std::fs::rename(&src, &dst)?;
@@ -99,4 +113,20 @@ impl Store {
 /// Set `path`'s mtime to now without rewriting its contents.
 fn touch(path: &std::path::Path) -> std::io::Result<()> {
     filetime::set_file_mtime(path, filetime::FileTime::now())
+}
+
+fn sha256_of_file(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
