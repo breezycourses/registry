@@ -267,10 +267,11 @@ pub async fn run(app: &AppRef, dry_run: bool) -> anyhow::Result<GcReport> {
     Ok(report)
 }
 
-/// Row-less files are checked and unlinked this many at a time, so the DB
-/// write lock is held for one short query plus a handful of unlinks, never
-/// for the whole cache.
-const LOCAL_SWEEP_BATCH: usize = 500;
+/// Candidates are checked and unlinked this many at a time: the walk buffers
+/// at most this many entries before draining them, and the DB write lock is
+/// held for one query, a re-stat and a few dozen unlinks — milliseconds —
+/// never for the whole cache.
+const LOCAL_SWEEP_BATCH: usize = 100;
 
 /// Phase 4, object mode only: the local blob cache. Files under
 /// `<data>/blobs/` are a read-through cache of bucket objects; the `blobs`
@@ -283,17 +284,20 @@ const LOCAL_SWEEP_BATCH: usize = 500;
 /// reference.
 ///
 /// Safety is the same shape as the rest of the module. Nothing younger than
-/// `gc_grace_seconds` is touched: an upload commits its file (and refreshes
-/// the mtime when it dedups onto an existing one) before its row is written,
-/// and a read-through fill does the same, so a file inside the window may be
-/// mid-commit and is left alone. The accounting check and the unlink run
-/// inside the DB write lock, with a re-stat of the mtime under it, so a row
-/// or reference can't land between "unaccounted" and the unlink — the writer either ran first (we see its
-/// row) or runs after (its commit finds no file and renames a fresh one in).
-/// A pull that has the file open keeps reading its inode; a pull that arrives
-/// after the unlink has no row either and re-fetches from the bucket. The
-/// directory walk itself happens outside every lock. `staging/` is never
-/// visited.
+/// `gc_grace_seconds` is touched (strictly: a file must be older than the
+/// cutoff, so with a zero grace a file committed this second still stands).
+/// An upload commits its file before its row is written, with the bucket
+/// PUT in between, and a read-through fill does the same, so the grace must
+/// cover that gap — the assumption phase 2 already makes about pushes. The
+/// accounting check, a re-stat of the mtime and the unlink run inside the DB
+/// write lock, and `Store::commit` places (or touches) a file under the same
+/// lock, so a commit can never land between "unaccounted" and the unlink:
+/// it either ran first, leaving a fresh mtime the re-stat respects, or runs
+/// after, finding no file and renaming a fresh one in. A pull that has the
+/// file open keeps reading its inode; a pull that arrives after the unlink
+/// has no row either and re-fetches from the bucket. The walk streams: at
+/// most one batch of candidates is buffered, and the directory is read
+/// outside the lock. `staging/` is never visited.
 ///
 /// Local mode is skipped outright: there the blob directory *is* the source
 /// of truth, and a row-less file can't be proven garbage.
@@ -304,14 +308,20 @@ async fn sweep_local_cache(app: &AppRef, dry_run: bool) -> anyhow::Result<(usize
         return Ok((0, 0));
     }
     let cutoff = db::now() - app.cfg.gc_grace_seconds;
-
-    // Walk <blobs>/<algo>/<xx>/<hex> on the blocking pool. Only files already
-    // past the grace window come back — the young ones aren't candidates and
-    // there's no point carrying them.
-    let root = app.store.blobs_root();
-    let candidates: Vec<(String, i64)> = tokio::task::spawn_blocking(move || {
-        let mut out = vec![];
-        for algo in read_dirs(&root) {
+    let pool = app.pool.clone();
+    let store = app.store.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut batch: Vec<(String, i64)> = Vec::with_capacity(LOCAL_SWEEP_BATCH);
+        let (mut files, mut bytes) = (0usize, 0i64);
+        let mut drain = |batch: &mut Vec<(String, i64)>| -> anyhow::Result<()> {
+            let (f, b) = sweep_batch(&pool, &store, batch, cutoff, dry_run)?;
+            files += f;
+            bytes += b;
+            batch.clear();
+            Ok(())
+        };
+        // <blobs>/<algo>/<xx>/<hex>
+        for algo in read_dirs(&store.blobs_root()) {
             let Some(algo_name) = algo.file_name().and_then(|n| n.to_str()).map(String::from)
             else {
                 continue;
@@ -320,74 +330,81 @@ async fn sweep_local_cache(app: &AppRef, dry_run: bool) -> anyhow::Result<(usize
                 let Ok(entries) = std::fs::read_dir(&shard) else { continue };
                 for entry in entries.flatten() {
                     let Ok(meta) = entry.metadata() else { continue };
-                    if !meta.is_file() || mtime_secs(&meta) > cutoff {
+                    if !meta.is_file() || mtime_secs(&meta) >= cutoff {
                         continue;
                     }
                     let Some(hex) = entry.file_name().to_str().map(String::from) else {
                         continue;
                     };
-                    out.push((format!("{algo_name}:{hex}"), meta.len() as i64));
+                    batch.push((format!("{algo_name}:{hex}"), meta.len() as i64));
+                    if batch.len() >= LOCAL_SWEEP_BATCH {
+                        drain(&mut batch)?;
+                    }
                 }
             }
         }
-        out
+        drain(&mut batch)?;
+        Ok((files, bytes))
     })
-    .await?;
+    .await?
+}
 
+/// One batch of the local-cache sweep: which of these digests are unaccounted
+/// for, and (unless dry-running) unlink their files. Runs under the DB write
+/// lock when it deletes; see `sweep_local_cache` for why. A dry run re-stats
+/// too, so its preview is the real sweep's decision, not the walk's snapshot.
+fn sweep_batch(
+    pool: &db::DbPool,
+    store: &crate::storage::Store,
+    batch: &[(String, i64)],
+    cutoff: i64,
+    dry_run: bool,
+) -> anyhow::Result<(usize, i64)> {
+    use crate::schema::{blobs as b, manifest_refs as r};
+    let _serialized = (!dry_run).then(db::write_lock);
+    let mut conn = pool.get()?;
+    let digests: Vec<&str> = batch.iter().map(|(d, _)| d.as_str()).collect();
+    // A row or a manifest reference both mean "accounted", exactly as in
+    // `still_unaccounted`: a referenced blob has no row until a pull fills
+    // it, and its file must survive either way.
+    let mut accounted: HashSet<String> = b::table
+        .filter(b::digest.eq_any(&digests))
+        .select(b::digest)
+        .load::<String>(&mut conn)?
+        .into_iter()
+        .collect();
+    accounted.extend(
+        r::table
+            .filter(r::child_digest.eq_any(&digests).and(r::kind.eq("blob")))
+            .select(r::child_digest)
+            .load::<String>(&mut conn)?,
+    );
     let (mut files, mut bytes) = (0usize, 0i64);
-    for batch in candidates.chunks(LOCAL_SWEEP_BATCH) {
-        let batch = batch.to_vec();
-        let store = app.store.clone();
-        let check_and_delete = move |conn: &mut diesel::SqliteConnection| {
-            use crate::schema::{blobs as b, manifest_refs as r};
-            let digests: Vec<&str> = batch.iter().map(|(d, _)| d.as_str()).collect();
-            // A row or a manifest reference both mean "accounted", exactly as
-            // in `still_unaccounted`: a referenced blob has no row until a
-            // pull fills it, and its file must survive either way.
-            let mut rowed: HashSet<String> = b::table
-                .filter(b::digest.eq_any(&digests))
-                .select(b::digest)
-                .load::<String>(conn)?
-                .into_iter()
-                .collect();
-            rowed.extend(
-                r::table
-                    .filter(r::child_digest.eq_any(&digests).and(r::kind.eq("blob")))
-                    .select(r::child_digest)
-                    .load::<String>(conn)?,
-            );
-            let mut freed = (0usize, 0i64);
-            for (digest, size) in &batch {
-                if rowed.contains(digest) {
-                    continue;
-                }
-                if dry_run {
-                    freed = (freed.0 + 1, freed.1 + size);
-                    continue;
-                }
-                // Re-stat under the lock: a commit that dedup'd onto this
-                // file since the walk refreshed its mtime.
-                let path = store.blob_path(digest);
-                match std::fs::metadata(&path) {
-                    Ok(m) if mtime_secs(&m) > cutoff => continue,
-                    Ok(_) => {}
-                    Err(_) => continue,
-                }
-                match std::fs::remove_file(&path) {
-                    Ok(()) => freed = (freed.0 + 1, freed.1 + size),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => tracing::warn!("gc: failed to delete cached blob {digest}: {e}"),
-                }
+    for (digest, size) in batch {
+        if accounted.contains(digest) {
+            continue;
+        }
+        // Re-stat under the lock: a commit that dedup'd onto this file since
+        // the walk refreshed its mtime, or replaced it outright.
+        let path = store.blob_path(digest);
+        match std::fs::metadata(&path) {
+            Ok(m) if mtime_secs(&m) >= cutoff => continue,
+            Ok(_) => {}
+            Err(_) => continue,
+        }
+        if dry_run {
+            files += 1;
+            bytes += size;
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                files += 1;
+                bytes += size;
             }
-            Ok(freed)
-        };
-        let (f, b) = if dry_run {
-            db::run(&app.pool, check_and_delete).await?
-        } else {
-            db::run_write(&app.pool, check_and_delete).await?
-        };
-        files += f;
-        bytes += b;
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("gc: failed to delete cached blob {digest}: {e}"),
+        }
     }
     Ok((files, bytes))
 }
@@ -1215,6 +1232,30 @@ mod tests {
         let report = run(&app, false).await.unwrap();
         assert_eq!(report.local_cache_files_deleted, 0);
         assert!(leaked.exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_dedup_commit_onto_a_read_only_file_replaces_it() {
+        let root = std::env::temp_dir().join(format!("breezy-gc-test-{}", uuid::Uuid::new_v4()));
+        let (app, _os) = app(&root, 3600);
+
+        // An operator made the cache read-only. The touch can't refresh the
+        // mtime, so the staged copy is renamed over the old file instead —
+        // the upload still succeeds and the file is still fresh.
+        let leaked = cache_file(&app, &sha('6'), b"same bytes", 7200);
+        let mut perms = std::fs::metadata(&leaked).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&leaked, perms).unwrap();
+        app.store.create_staging("up-2").await.unwrap();
+        std::fs::write(app.store.staging_path("up-2"), b"same bytes").unwrap();
+        app.store.commit("up-2", &sha('6')).await.unwrap();
+
+        let meta = std::fs::metadata(&leaked).unwrap();
+        assert!(mtime_secs(&meta) > db::now() - 60);
+        assert!(!app.store.staging_path("up-2").exists());
+        assert_eq!(std::fs::read(&leaked).unwrap(), b"same bytes");
 
         std::fs::remove_dir_all(&root).ok();
     }

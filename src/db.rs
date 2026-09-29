@@ -124,6 +124,15 @@ where
 /// concurrent under WAL.
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The global write lock, for the two filesystem steps that must be ordered
+/// against each other and against row writes: `Store::commit` placing a
+/// blob file, and GC's local-cache sweep unlinking one. Holding it for a
+/// stat and a rename keeps a commit from landing between the sweep's
+/// "no row" check and its unlink. Blocking; call it off the async runtime.
+pub fn write_lock() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub async fn run_write<T, F>(pool: &DbPool, f: F) -> anyhow::Result<T>
 where
     F: FnOnce(&mut SqliteConnection) -> anyhow::Result<T> + Send + 'static,
@@ -131,7 +140,7 @@ where
 {
     let pool = pool.clone();
     tokio::task::spawn_blocking(move || {
-        let _serialized = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialized = write_lock();
         let mut conn = pool.get()?;
         f(&mut conn)
     })

@@ -31,6 +31,14 @@ impl Store {
     }
 
     /// Move a verified staging file into the content-addressed location. Returns its size.
+    ///
+    /// The placement step runs under the DB write lock, the same lock GC's
+    /// local-cache sweep holds while it decides a row-less file is garbage
+    /// and unlinks it. Serializing the two means either the sweep ran first
+    /// (the file is gone, we rename a fresh one in) or we ran first (the
+    /// file's mtime is fresh, so the sweep's re-stat skips it): a commit
+    /// can never land between the sweep's check and its unlink, and the row
+    /// our caller writes afterwards always points at a file.
     pub async fn commit(&self, uuid: &str, digest: &str) -> std::io::Result<u64> {
         let src = self.staging_path(uuid);
         let dst = self.blob_path(digest);
@@ -38,26 +46,27 @@ impl Store {
         if let Some(parent) = dst.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        if tokio::fs::metadata(&dst).await.is_ok() {
-            // Blob already present (dedup) — drop the duplicate upload. But
-            // first refresh the kept file's mtime: GC's local-cache sweep
-            // reclaims row-less files older than the grace window, and the
-            // file we are about to reuse may be exactly such a leftover with
-            // its row still to be written by our caller. A fresh mtime puts
-            // it back inside the window until the row lands. If the sweep
-            // unlinked it between the existence check and the touch, fall
-            // through to the rename so the upload still ends up in place.
-            match touch(&dst).await {
-                Ok(()) => tokio::fs::remove_file(&src).await?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    tokio::fs::rename(&src, &dst).await?
+        tokio::task::spawn_blocking(move || {
+            let _serialized = crate::db::write_lock();
+            if std::fs::metadata(&dst).is_ok() {
+                // Blob already present (dedup) — drop the duplicate upload.
+                // But first refresh the kept file's mtime: the sweep reclaims
+                // row-less files older than the grace window, and the file we
+                // are about to reuse may be exactly such a leftover with its
+                // row still to be written by our caller. A fresh mtime puts it
+                // back inside the window until the row lands. If the file
+                // can't be touched (read-only, say), rename the staged copy
+                // over it instead — same bytes, fresh inode, fresh mtime.
+                match touch(&dst) {
+                    Ok(()) => std::fs::remove_file(&src)?,
+                    Err(_) => std::fs::rename(&src, &dst)?,
                 }
-                Err(e) => return Err(e),
+            } else {
+                std::fs::rename(&src, &dst)?;
             }
-        } else {
-            tokio::fs::rename(&src, &dst).await?;
-        }
-        Ok(size)
+            Ok(size)
+        })
+        .await?
     }
 
     /// The directory the content-addressed blob files live under.
@@ -82,13 +91,9 @@ impl Store {
 }
 
 /// Set `path`'s mtime to now without rewriting its contents.
-async fn touch(path: &std::path::Path) -> std::io::Result<()> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)?
-            .set_modified(std::time::SystemTime::now())
-    })
-    .await?
+fn touch(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_modified(std::time::SystemTime::now())
 }
