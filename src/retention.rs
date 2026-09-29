@@ -211,8 +211,12 @@ pub async fn retention_loop(app: AppRef) {
                 report
                     .gc
                     .map(|g| format!(
-                        "; gc freed {} bytes ({} manifests, {} blobs)",
-                        g.bytes_freed, g.manifests_deleted, g.blobs_deleted
+                        "; gc freed {} bytes ({} manifests, {} blobs); local cache freed {} bytes ({} files)",
+                        g.bytes_freed,
+                        g.manifests_deleted,
+                        g.blobs_deleted,
+                        g.local_cache_bytes_freed,
+                        g.local_cache_files_deleted
                     ))
                     .unwrap_or_default(),
             ),
