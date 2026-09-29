@@ -54,12 +54,18 @@ impl Store {
                 // row-less files older than the grace window, and the file we
                 // are about to reuse may be exactly such a leftover with its
                 // row still to be written by our caller. A fresh mtime puts it
-                // back inside the window until the row lands. If the file
-                // can't be touched (read-only, say), rename the staged copy
-                // over it instead — same bytes, fresh inode, fresh mtime.
+                // back inside the window until the row lands. The touch goes
+                // by path (utimensat), which needs ownership, not write
+                // permission, so a read-only cache is fine. If the file
+                // vanished since the check the sweep took it: rename ours in.
+                // The staged bytes are never used to replace an existing
+                // file — a read-through fill hasn't verified them.
                 match touch(&dst) {
                     Ok(()) => std::fs::remove_file(&src)?,
-                    Err(_) => std::fs::rename(&src, &dst)?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::rename(&src, &dst)?
+                    }
+                    Err(e) => return Err(e),
                 }
             } else {
                 std::fs::rename(&src, &dst)?;
@@ -92,8 +98,5 @@ impl Store {
 
 /// Set `path`'s mtime to now without rewriting its contents.
 fn touch(path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)?
-        .set_modified(std::time::SystemTime::now())
+    filetime::set_file_mtime(path, filetime::FileTime::now())
 }

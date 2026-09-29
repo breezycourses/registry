@@ -1237,19 +1237,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dedup_commit_onto_a_read_only_file_replaces_it() {
+    async fn a_dedup_commit_onto_a_read_only_file_keeps_and_refreshes_it() {
         let root = std::env::temp_dir().join(format!("breezy-gc-test-{}", uuid::Uuid::new_v4()));
         let (app, _os) = app(&root, 3600);
 
-        // An operator made the cache read-only. The touch can't refresh the
-        // mtime, so the staged copy is renamed over the old file instead —
-        // the upload still succeeds and the file is still fresh.
+        // An operator made the cache read-only. The touch goes by path, so
+        // it still refreshes the mtime, and the existing bytes stay — the
+        // staged copy (unverified on the read-through path) never replaces
+        // a file that is already in place.
         let leaked = cache_file(&app, &sha('6'), b"same bytes", 7200);
         let mut perms = std::fs::metadata(&leaked).unwrap().permissions();
         perms.set_readonly(true);
         std::fs::set_permissions(&leaked, perms).unwrap();
         app.store.create_staging("up-2").await.unwrap();
-        std::fs::write(app.store.staging_path("up-2"), b"same bytes").unwrap();
+        std::fs::write(app.store.staging_path("up-2"), b"other bytes").unwrap();
         app.store.commit("up-2", &sha('6')).await.unwrap();
 
         let meta = std::fs::metadata(&leaked).unwrap();
