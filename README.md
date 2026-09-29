@@ -148,6 +148,20 @@ claim, all inside the lock pushes hold the read half of. Claims expire after
 `gc_grace_seconds` is ever deleted, which makes GC safe to run while pushes
 are in flight.
 
+Object mode ends with a sweep of the local blob cache under `<data_dir>/blobs/`.
+The cache is filled read-through and the `blobs` table is rebuilt from the bucket
+indexes before every sweep, so a blob that a bucket index no longer references
+has no row here and none of the phases above will ever name it — its file would
+otherwise sit on disk forever. The sweep walks the directory outside any lock,
+then checks digests against the `blobs` and `manifest_refs` tables in batches
+and unlinks every file that has neither a row nor a reference and is older than
+`gc_grace_seconds` (an upload or read-through
+fill writes its file before its row, so young files are left alone; `staging/`
+is never visited). A pull that races the unlink re-fetches the blob from the
+bucket. The report shows this as `local_cache_files_deleted` and
+`local_cache_bytes_freed`; a dry run counts without deleting. In local mode the
+blob directory is the source of truth and this sweep does not run.
+
 Deleting: `DELETE /v2/<repo>/manifests/<tag>` untags; `DELETE .../manifests/<digest>`
 removes the manifest; GC then reclaims unreferenced blobs.
 

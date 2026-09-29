@@ -19,6 +19,13 @@ pub struct GcReport {
     pub orphan_bytes_freed: i64,
     /// Candidates recorded (or still pending) this run — next run's deletions.
     pub orphans_marked: usize,
+    /// Object mode only: files in the local blob cache whose digest has no
+    /// `blobs` row and no manifest reference. The cache is filled read-through and the DB is rebuilt
+    /// from the bucket, so once a bucket index drops a blob its row vanishes
+    /// on the next rebuild while the file stays — nothing above ever sees it
+    /// again. Only files older than the grace window are taken.
+    pub local_cache_files_deleted: usize,
+    pub local_cache_bytes_freed: i64,
 }
 
 /// Mark & sweep. A manifest is kept if it is tagged, referenced by a kept index,
@@ -145,6 +152,8 @@ pub async fn run(app: &AppRef, dry_run: bool) -> anyhow::Result<GcReport> {
         orphan_blobs_deleted: 0,
         orphan_bytes_freed: 0,
         orphans_marked: 0,
+        local_cache_files_deleted: 0,
+        local_cache_bytes_freed: 0,
     };
     if dry_run {
         (
@@ -153,6 +162,8 @@ pub async fn run(app: &AppRef, dry_run: bool) -> anyhow::Result<GcReport> {
             report.orphan_bytes_freed,
             report.orphans_marked,
         ) = sweep_orphans(app, &known_manifests, &known_blobs, true).await?;
+        (report.local_cache_files_deleted, report.local_cache_bytes_freed) =
+            sweep_local_cache(app, true).await?;
         return Ok(report);
     }
 
@@ -251,7 +262,153 @@ pub async fn run(app: &AppRef, dry_run: bool) -> anyhow::Result<GcReport> {
         report.orphan_bytes_freed,
         report.orphans_marked,
     ) = sweep_orphans(app, &known_manifests, &known_blobs, false).await?;
+    (report.local_cache_files_deleted, report.local_cache_bytes_freed) =
+        sweep_local_cache(app, false).await?;
     Ok(report)
+}
+
+/// Row-less files are checked and unlinked this many at a time, so the DB
+/// write lock is held for one short query plus a handful of unlinks, never
+/// for the whole cache.
+const LOCAL_SWEEP_BATCH: usize = 500;
+
+/// Phase 4, object mode only: the local blob cache. Files under
+/// `<data>/blobs/` are a read-through cache of bucket objects; the `blobs`
+/// table is rebuilt from the bucket indexes on boot and before every sweep.
+/// Phase 2 unlinks a file only when it deletes that file's row — but a blob
+/// dropped from a bucket index (by GC, retention, or another replica) simply
+/// has no row after the next rebuild, so no phase above ever names it again
+/// and its file sits on disk for good. This phase walks the directory and
+/// removes every file whose digest has neither a row nor a manifest
+/// reference.
+///
+/// Safety is the same shape as the rest of the module. Nothing younger than
+/// `gc_grace_seconds` is touched: an upload commits its file (and refreshes
+/// the mtime when it dedups onto an existing one) before its row is written,
+/// and a read-through fill does the same, so a file inside the window may be
+/// mid-commit and is left alone. The accounting check and the unlink run
+/// inside the DB write lock, with a re-stat of the mtime under it, so a row
+/// or reference can't land between "unaccounted" and the unlink — the writer either ran first (we see its
+/// row) or runs after (its commit finds no file and renames a fresh one in).
+/// A pull that has the file open keeps reading its inode; a pull that arrives
+/// after the unlink has no row either and re-fetches from the bucket. The
+/// directory walk itself happens outside every lock. `staging/` is never
+/// visited.
+///
+/// Local mode is skipped outright: there the blob directory *is* the source
+/// of truth, and a row-less file can't be proven garbage.
+///
+/// Returns (files_deleted, bytes_freed).
+async fn sweep_local_cache(app: &AppRef, dry_run: bool) -> anyhow::Result<(usize, i64)> {
+    if app.object.is_none() {
+        return Ok((0, 0));
+    }
+    let cutoff = db::now() - app.cfg.gc_grace_seconds;
+
+    // Walk <blobs>/<algo>/<xx>/<hex> on the blocking pool. Only files already
+    // past the grace window come back — the young ones aren't candidates and
+    // there's no point carrying them.
+    let root = app.store.blobs_root();
+    let candidates: Vec<(String, i64)> = tokio::task::spawn_blocking(move || {
+        let mut out = vec![];
+        for algo in read_dirs(&root) {
+            let Some(algo_name) = algo.file_name().and_then(|n| n.to_str()).map(String::from)
+            else {
+                continue;
+            };
+            for shard in read_dirs(&algo) {
+                let Ok(entries) = std::fs::read_dir(&shard) else { continue };
+                for entry in entries.flatten() {
+                    let Ok(meta) = entry.metadata() else { continue };
+                    if !meta.is_file() || mtime_secs(&meta) > cutoff {
+                        continue;
+                    }
+                    let Some(hex) = entry.file_name().to_str().map(String::from) else {
+                        continue;
+                    };
+                    out.push((format!("{algo_name}:{hex}"), meta.len() as i64));
+                }
+            }
+        }
+        out
+    })
+    .await?;
+
+    let (mut files, mut bytes) = (0usize, 0i64);
+    for batch in candidates.chunks(LOCAL_SWEEP_BATCH) {
+        let batch = batch.to_vec();
+        let store = app.store.clone();
+        let check_and_delete = move |conn: &mut diesel::SqliteConnection| {
+            use crate::schema::{blobs as b, manifest_refs as r};
+            let digests: Vec<&str> = batch.iter().map(|(d, _)| d.as_str()).collect();
+            // A row or a manifest reference both mean "accounted", exactly as
+            // in `still_unaccounted`: a referenced blob has no row until a
+            // pull fills it, and its file must survive either way.
+            let mut rowed: HashSet<String> = b::table
+                .filter(b::digest.eq_any(&digests))
+                .select(b::digest)
+                .load::<String>(conn)?
+                .into_iter()
+                .collect();
+            rowed.extend(
+                r::table
+                    .filter(r::child_digest.eq_any(&digests).and(r::kind.eq("blob")))
+                    .select(r::child_digest)
+                    .load::<String>(conn)?,
+            );
+            let mut freed = (0usize, 0i64);
+            for (digest, size) in &batch {
+                if rowed.contains(digest) {
+                    continue;
+                }
+                if dry_run {
+                    freed = (freed.0 + 1, freed.1 + size);
+                    continue;
+                }
+                // Re-stat under the lock: a commit that dedup'd onto this
+                // file since the walk refreshed its mtime.
+                let path = store.blob_path(digest);
+                match std::fs::metadata(&path) {
+                    Ok(m) if mtime_secs(&m) > cutoff => continue,
+                    Ok(_) => {}
+                    Err(_) => continue,
+                }
+                match std::fs::remove_file(&path) {
+                    Ok(()) => freed = (freed.0 + 1, freed.1 + size),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => tracing::warn!("gc: failed to delete cached blob {digest}: {e}"),
+                }
+            }
+            Ok(freed)
+        };
+        let (f, b) = if dry_run {
+            db::run(&app.pool, check_and_delete).await?
+        } else {
+            db::run_write(&app.pool, check_and_delete).await?
+        };
+        files += f;
+        bytes += b;
+    }
+    Ok((files, bytes))
+}
+
+fn read_dirs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(i64::MAX)
 }
 
 /// Phase 3: objects no index ever recorded. The mark phase only sees what the
@@ -930,6 +1087,134 @@ mod tests {
         assert_eq!(report.orphan_blobs_deleted, 0);
         assert!(os.head(&manifest_key(&sha('c'))).await.unwrap());
         assert!(os.head(&blob_key(&sha('d'))).await.unwrap());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Write a file into the local blob cache directly — the leftover of a
+    /// read-through fill whose blob has since dropped out of every bucket
+    /// index — aged `age` seconds into the past.
+    fn cache_file(app: &AppRef, digest: &str, body: &[u8], age: i64) -> std::path::PathBuf {
+        let path = app.store.blob_path(digest);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        let t = filetime::FileTime::from_unix_time(db::now() - age, 0);
+        filetime::set_file_mtime(&path, t).unwrap();
+        path
+    }
+
+    async fn insert_blob_row(app: &AppRef, digest: &str, size: i64) {
+        let d = digest.to_string();
+        db::run_write(&app.pool, move |conn| {
+            use crate::schema::blobs as b;
+            diesel::insert_into(b::table)
+                .values((b::digest.eq(&d), b::size.eq(size), b::created_at.eq(db::now())))
+                .execute(conn)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_cache_sweep_reclaims_old_rowless_files_only() {
+        let root = std::env::temp_dir().join(format!("breezy-gc-test-{}", uuid::Uuid::new_v4()));
+        let (app, os) = app(&root, 3600);
+        seed(&os).await;
+
+        // Three cache files: an old one with no row (the leak), a young one
+        // with no row (a fill or upload still committing), and an old one
+        // that a manifest references. Plus a staging file,
+        // which is never the sweep's business.
+        let leaked = cache_file(&app, &sha('1'), b"leaked layer", 7200);
+        let young = cache_file(&app, &sha('2'), b"in-flight", 0);
+        let live = cache_file(&app, &sha('b'), b"live layer", 7200);
+        let staging = app.store.staging_path("fill-test");
+        std::fs::write(&staging, b"partial").unwrap();
+        let t = filetime::FileTime::from_unix_time(db::now() - 7200, 0);
+        filetime::set_file_mtime(&staging, t).unwrap();
+
+        // Dry run reports the leak and touches nothing.
+        let dry = run(&app, true).await.unwrap();
+        assert_eq!(dry.local_cache_files_deleted, 1);
+        assert_eq!(dry.local_cache_bytes_freed, "leaked layer".len() as i64);
+        assert!(leaked.exists());
+
+        let report = run(&app, false).await.unwrap();
+        assert_eq!(report.local_cache_files_deleted, 1);
+        assert_eq!(report.local_cache_bytes_freed, "leaked layer".len() as i64);
+        assert!(!leaked.exists());
+        assert!(young.exists());
+        assert!(live.exists());
+        assert!(staging.exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn local_cache_sweep_keeps_a_file_whose_row_is_unreferenced() {
+        let root = std::env::temp_dir().join(format!("breezy-gc-test-{}", uuid::Uuid::new_v4()));
+        let (app, os) = app(&root, 3600);
+        seed(&os).await;
+
+        // A row without a manifest reference is still a row: phase 2 owns
+        // its lifecycle (row, file and object go together once it ages
+        // out), so the cache sweep must not take the file from under it.
+        let rowed = cache_file(&app, &sha('3'), b"rowed layer", 7200);
+        insert_blob_row(&app, &sha('3'), 11).await;
+
+        let report = run(&app, false).await.unwrap();
+        assert_eq!(report.local_cache_files_deleted, 0);
+        assert!(rowed.exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn local_cache_sweep_does_not_run_in_local_mode() {
+        let root = std::env::temp_dir().join(format!("breezy-gc-test-{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let app: AppRef = Arc::new(App {
+            pool: db::init(data.to_str().unwrap()).unwrap(),
+            store: Store::new(data.to_str().unwrap()).unwrap(),
+            cfg: Config { gc_grace_seconds: 0, ..Config::default() },
+            object: None,
+            repo_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            gc_lock: tokio::sync::RwLock::new(()),
+        });
+
+        // In local mode the blob directory is the truth. A row-less file is
+        // not provably garbage, so even an ancient one stays.
+        let file = cache_file(&app, &sha('4'), b"local truth", 7200);
+        let report = run(&app, false).await.unwrap();
+        assert_eq!(report.local_cache_files_deleted, 0);
+        assert_eq!(report.local_cache_bytes_freed, 0);
+        assert!(file.exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_dedup_commit_refreshes_the_kept_files_mtime() {
+        let root = std::env::temp_dir().join(format!("breezy-gc-test-{}", uuid::Uuid::new_v4()));
+        let (app, _os) = app(&root, 3600);
+
+        // An upload of a digest whose leaked file is still on disk dedups
+        // onto it. The file must come back inside the grace window, or the
+        // sweep could unlink it before the upload's row is written.
+        let leaked = cache_file(&app, &sha('5'), b"same bytes", 7200);
+        app.store.create_staging("up-1").await.unwrap();
+        std::fs::write(app.store.staging_path("up-1"), b"same bytes").unwrap();
+        app.store.commit("up-1", &sha('5')).await.unwrap();
+
+        let meta = std::fs::metadata(&leaked).unwrap();
+        assert!(mtime_secs(&meta) > db::now() - 60);
+        assert!(!app.store.staging_path("up-1").exists());
+
+        let report = run(&app, false).await.unwrap();
+        assert_eq!(report.local_cache_files_deleted, 0);
+        assert!(leaked.exists());
 
         std::fs::remove_dir_all(&root).ok();
     }

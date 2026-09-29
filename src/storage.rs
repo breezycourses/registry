@@ -39,12 +39,30 @@ impl Store {
             tokio::fs::create_dir_all(parent).await?;
         }
         if tokio::fs::metadata(&dst).await.is_ok() {
-            // Blob already present (dedup) — drop the duplicate upload.
-            tokio::fs::remove_file(&src).await?;
+            // Blob already present (dedup) — drop the duplicate upload. But
+            // first refresh the kept file's mtime: GC's local-cache sweep
+            // reclaims row-less files older than the grace window, and the
+            // file we are about to reuse may be exactly such a leftover with
+            // its row still to be written by our caller. A fresh mtime puts
+            // it back inside the window until the row lands. If the sweep
+            // unlinked it between the existence check and the touch, fall
+            // through to the rename so the upload still ends up in place.
+            match touch(&dst).await {
+                Ok(()) => tokio::fs::remove_file(&src).await?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::fs::rename(&src, &dst).await?
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             tokio::fs::rename(&src, &dst).await?;
         }
         Ok(size)
+    }
+
+    /// The directory the content-addressed blob files live under.
+    pub fn blobs_root(&self) -> PathBuf {
+        self.root.join("blobs")
     }
 
     pub async fn open(&self, digest: &str) -> std::io::Result<tokio::fs::File> {
@@ -61,4 +79,16 @@ impl Store {
     pub async fn delete_staging(&self, uuid: &str) {
         let _ = tokio::fs::remove_file(self.staging_path(uuid)).await;
     }
+}
+
+/// Set `path`'s mtime to now without rewriting its contents.
+async fn touch(path: &std::path::Path) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_modified(std::time::SystemTime::now())
+    })
+    .await?
 }
